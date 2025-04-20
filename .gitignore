@@ -13,3 +13,4 @@ __pycache__/
 
 # Archivos de entorno/API
 .env
+patio.sh
