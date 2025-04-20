@@ -1,0 +1,15 @@
+# Entorno virtual
+venv_chatgpt/
+
+# Python
+*.pyc
+__pycache__/
+
+# Logs
+*.log
+
+# Archivos ocultos de sistema
+.DS_Store
+
+# Archivos de entorno/API
+.env
