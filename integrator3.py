@@ -30,6 +30,79 @@ import queue
 from google.cloud import speech
 import random
 import math
+import board
+import neopixel
+import threading
+
+# - Leds Brazo -
+
+LED_COUNT = 13
+pixels = neopixel.NeoPixel(board.D18, LED_COUNT, brightness=0.05, auto_write=False)
+
+PALETA = [
+    (184, 115, 51),   # Cobre
+    (205, 133, 63),   # Latón
+    (139, 69, 19),    # Óxido
+    (112, 128, 40),   # Verdín
+    (255, 215, 0),    # Oro viejo
+    (72, 60, 50)      # Metal sucio
+]
+
+def pulso_oxidado(t, i):
+    intensidad = (math.sin(t + i * 0.5) + 1) / 2
+    base_color = PALETA[i % len(PALETA)]
+    return tuple(int(c * intensidad) for c in base_color)
+
+# Variable global para controlar el hilo de LEDs
+led_thread_running = False
+led_thread = None
+
+def steampunk_danza(delay=0.04):
+    global led_thread_running
+    t = 0
+    glitch_timer = 0
+    try:
+        while led_thread_running:
+            for i in range(LED_COUNT):
+                if glitch_timer > 0 and i == random.randint(0, LED_COUNT - 1):
+                    pixels[i] = random.choice([(0, 255, 180), (255, 255, 255)])
+                else:
+                    pixels[i] = pulso_oxidado(t, i)
+            pixels.show()
+            time.sleep(delay)
+            t += 0.1
+            glitch_timer = glitch_timer - 1 if glitch_timer > 0 else random.randint(0, 20)
+    except:
+        pass
+    finally:
+        for b in reversed(range(10)):
+            pixels.brightness = b / 10
+            pixels.show()
+            time.sleep(0.05)
+        pixels.fill((0, 0, 0))
+        pixels.show()
+
+def iniciar_luces():
+    global led_thread_running, led_thread
+    led_thread_running = True
+    led_thread = threading.Thread(target=steampunk_danza, daemon=True)
+    led_thread.start()
+
+def apagar_luces():
+    """Apaga los LEDs al salir del script."""
+    global led_thread_running, led_thread
+    try:
+        # Detener el hilo de LEDs
+        led_thread_running = False
+        if led_thread and led_thread.is_alive():
+            led_thread.join(timeout=2)
+        
+        # Apagar todos los LEDs
+        pixels.fill((0, 0, 0))
+        pixels.show()
+        print("[INFO] LEDs apagados.")
+    except Exception as e:
+        print(f"[ERROR] No se pudieron apagar los LEDs: {e}")
 
 # — Librería Waveshare —
 from lib import LCD_1inch9  # Asegúrate de que la carpeta "lib" esté junto al script
@@ -971,7 +1044,10 @@ def audio_callback(indata, frames, time_info, status):
     if status:
         print(f"[AUDIO] {status}")
     if not is_speaking:
-        audio_queue.append(bytes(indata))
+        # Filtrar ruido de baja amplitud
+        amplitude = np.max(np.abs(np.frombuffer(indata, dtype=np.int16)))
+        if amplitude > 500:  # Ajustar el umbral según el ruido de los servos
+            audio_queue.append(bytes(indata))
 
 # =============================================
 # Bucle principal
@@ -1062,10 +1138,10 @@ def main():
                             conversation_history.append({"role": "user", "content": command_text})
                             try:
                                 response = client.chat.completions.create(
-                                    model="gpt-4-1106-preview",
+                                    model="gpt-4o",
                                     messages=conversation_history,
                                     temperature=0.9,
-                                    max_tokens=150,
+                                    max_tokens=300,
                                     timeout=15
                                 )
                                 respuesta = response.choices[0].message.content
@@ -1098,7 +1174,7 @@ def main():
                                 
                                 # ✅ ACTIVAR OJOS
                                 activate_eyes()
-                                
+                                iniciar_luces()
                                 hablar("¿Qué quieres ahora, ser inferior?")
                                 audio_queue.clear()
                                 recognizer.Reset()
@@ -1121,8 +1197,31 @@ def main():
                     pass
             print("Sistema detenido.")
 
+def apagar_luces():
+    """Apaga los LEDs al salir del script."""
+    global led_thread_running, led_thread
+    try:
+        # Detener el hilo de LEDs
+        led_thread_running = False
+        if led_thread and led_thread.is_alive():
+            led_thread.join(timeout=2)
+        
+        # Apagar todos los LEDs
+        pixels.fill((0, 0, 0))
+        pixels.show()
+        print("[INFO] LEDs apagados.")
+    except Exception as e:
+        print(f"[ERROR] No se pudieron apagar los LEDs: {e}")
+
 if __name__ == "__main__":
     if speech_client:
-        main()
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("\nApagando…")
+        finally:
+            # ✅ Apagar LEDs al salir
+            apagar_luces()
+            print("Sistema detenido.")
     else:
         print("\nEl programa no puede continuar porque Google STT no se inicializó. Revisa las credenciales.")

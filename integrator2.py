@@ -2056,205 +2056,6 @@ class EyeTrackingThread(threading.Thread):
 
         print("🛑 [EYES] Hilo de seguimiento facial detenido")
 
-def main():
-    global eyes_active
-    
-    model = init_vosk()
-    recognizer = vosk.KaldiRecognizer(model, MIC_RATE)
-
-    stream = sd.RawInputStream(
-        samplerate=MIC_RATE,
-        blocksize=8000,
-        channels=1,
-        dtype="int16",
-        callback=audio_callback,
-    )
-
-    conversation_history = [
-        {
-            "role": "system",
-            "content": "Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario.",
-        }
-    ]
-    
-    # --- Variables para controlar el estado y el timeout de la conversación ---
-    is_conversation_active = False
-    last_interaction_time = time.time()
-    INACTIVITY_TIMEOUT = 120  # 2 minutos para desactivarse por inactividad
-    WARNING_TIME = 90       # 90 segundos para un aviso de inactividad
-    has_warned = False
-    
-    # ✅ INICIALIZACIÓN DEL SISTEMA DE OJOS AL ARRANQUE
-    print("🤖 [STARTUP] Inicializando sistema de ojos...")
-    
-    # Inicializar servos básicos para centrar
-    if kit:
-        initialize_eye_servos()
-        time.sleep(0.5)
-    
-    # Párpados cerrados al inicio (modo dormido)
-    close_eyelids()
-    
-    # ✅ NUEVO: Inicializar cámara al arranque
-    print("📷 [STARTUP] Inicializando cámara (puede tardar varios minutos)...")
-    init_camera_system()
-    
-    print("😴 [STARTUP] Sistema iniciado - Párpados cerrados (modo dormido)")
-    print("🎤 [STARTUP] Di 'Botijo' para despertar el sistema...")
-    
-    with stream:
-        try:
-            while True:
-                # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
-                if is_conversation_active:
-                    inactive_time = time.time() - last_interaction_time
-
-                    if inactive_time > INACTIVITY_TIMEOUT:
-                        print("\n[INFO] Desactivado por inactividad.")
-                        hablar("Me aburres, humano. Vuelve a llamarme si tienes algo interesante que decir.")
-                        is_conversation_active = False
-                        has_warned = False
-                        conversation_history = [conversation_history[0]]
-                        audio_queue.clear()
-                        recognizer.Reset()
-                        
-                        # ✅ DESACTIVAR OJOS (pero mantener cámara)
-                        deactivate_eyes()
-                        continue
-
-                    elif inactive_time > WARNING_TIME and not has_warned:
-                        hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
-                        has_warned = True
-
-                # --- LÓGICA DE ESCUCHA ---
-                if is_conversation_active:
-                    # VERIFICACIÓN MEJORADA: Solo escuchar si no está hablando
-                    if not is_speaking:
-                        # --- FASE DE COMANDO (GOOGLE STT) ---
-                        if stream.active:
-                            stream.stop()
-                        
-                        command_text = listen_for_command_google()
-                        
-                        if not stream.active:
-                            stream.start()
-
-                        if command_text:
-                            last_interaction_time = time.time()
-                            has_warned = False
-                            
-                            print(f"\nHumano: {command_text}")
-                            conversation_history.append({"role": "user", "content": command_text})
-                            try:
-                                response = client.chat.completions.create(
-                                    model="gpt-4-1106-preview",
-                                    messages=conversation_history,
-                                    temperature=0.9,
-                                    max_tokens=150,
-                                    timeout=15
-                                )
-                                respuesta = response.choices[0].message.content
-                            except Exception as e:
-                                print(f"[CHATGPT] {e}")
-                                respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
-
-                            conversation_history.append({"role": "assistant", "content": respuesta})
-                            conversation_history = conversation_history[-10:]
-                            print(f"Androide: {respuesta}")
-                            hablar(respuesta)
-                            audio_queue.clear()
-                            recognizer.Reset()
-                    else:
-                        # Si está hablando, simplemente esperar
-                        time.sleep(0.1)
-
-                else:
-                    # --- FASE DE WAKE WORD (VOSK) ---
-                    if not is_speaking and audio_queue:
-                        audio_data = audio_queue.pop(0)
-                        if recognizer.AcceptWaveform(audio_data):
-                            text = json.loads(recognizer.Result()).get("text", "").lower()
-                            if "botijo" in text:
-                                is_conversation_active = True
-                                last_interaction_time = time.time()
-                                has_warned = False
-                                
-                                print("\n¡Botijo activado! Modo conversación iniciado...")
-                                
-                                # ✅ ACTIVAR OJOS (
-
-                if outputs is None:
-                    consecutive_no_outputs += 1
-                    if consecutive_no_outputs % 20 == 0:
-                        print(f"[EYES {iteration}] No outputs (consecutivos: {consecutive_no_outputs})")
-                    
-                    if consecutive_no_outputs > 100:
-                        print("⚠️ [EYES] Demasiados fallos, reiniciando...")
-                        time.sleep(1)
-                        consecutive_no_outputs = 0
-                    else:
-                        time.sleep(0.05)
-                    continue
-                
-                consecutive_no_outputs = 0
-
-                detections = process_detections(outputs, threshold=THRESHOLD)
-                # ✅ CORRECCIÓN QUIRÚRGICA: Usar intrinsics local como en ojopipa3.py
-                faces = [d for d in detections if intrinsics.labels[d["class_id"]] == "face"]
-
-                if not faces:
-                    if iteration % 40 == 0:
-                        print(f"[EYES {iteration}] Sin caras detectadas")
-                    time.sleep(0.1)
-                    continue
-
-                best = max(faces, key=lambda d: d["confidence"])
-                x1, y1, x2, y2 = best["bbox"]
-                x_center = (x1 + x2) / 2
-                y_center = (y1 + y2) / 2
-
-                input_width, input_height = imx500.get_input_size()
-
-                # Calcular ángulos objetivo
-                target_lr = map_range(x_center, 0, input_width, LR_MAX, LR_MIN)
-                target_lr = max(LR_MIN, min(LR_MAX, target_lr))
-                
-                target_ud = map_range(y_center, 0, input_height, UD_MAX, UD_MIN)
-                target_ud = max(UD_MIN, min(UD_MAX, target_ud))
-                
-                # Aplicar suavizado y micro-movimientos
-                smooth_lr = smooth_movement(previous_lr, target_lr, SMOOTHING_FACTOR)
-                smooth_ud = smooth_movement(previous_ud, target_ud, SMOOTHING_FACTOR)
-                
-                final_lr = add_micro_movement(smooth_lr)
-                final_ud = add_micro_movement(smooth_ud)
-                
-                # Aplicar límites finales
-                final_lr = max(LR_MIN, min(LR_MAX, final_lr))
-                final_ud = max(UD_MIN, min(UD_MAX, final_ud))
-
-                # Mover servos
-                if kit and eyes_active:
-                    try:
-                        kit.servo[SERVO_CHANNEL_LR].angle = final_lr
-                        kit.servo[SERVO_CHANNEL_UD].angle = final_ud
-                        
-                        # Actualizar posiciones anteriores
-                        previous_lr = final_lr
-                        previous_ud = final_ud
-
-                    
-                    except Exception as e:
-                        print(f"[EYES ERROR] Error moviendo servos: {e}")
-
-                time.sleep(0.05)  # 20 FPS aproximadamente
-                
-            except Exception as e:
-                print(f"[EYES ERROR] Error en hilo de seguimiento: {e}")
-                time.sleep(0.1)
-
-        print("🛑 [EYES] Hilo de seguimiento facial detenido")
-
 def activate_eyes():
     """✅ Activar sistema completo de ojos"""
     global eyes_active, eyes_tracking_thread
@@ -2842,3 +2643,296 @@ class EyeTrackingThread(threading.Thread):
 
                     
                     except Exception as e:
+                        print(f"[EYES ERROR] Error moviendo servos: {e}")
+
+                time.sleep(0.05)  # 20 FPS aproximadamente
+                
+            except Exception as e:
+                print(f"[EYES ERROR] Error en hilo de seguimiento: {e}")
+                time.sleep(0.1)
+
+        print("🛑 [EYES] Hilo de seguimiento facial detenido")
+
+def activate_eyes():
+    """✅ Activar sistema completo de ojos"""
+    global eyes_active, eyes_tracking_thread
+    
+    if eyes_active:
+        print("[EYES] Sistema de ojos ya está activo")
+        return
+    
+    print("👁️ [EYES] Activando sistema de ojos...")
+    
+    # Inicializar servos de movimiento
+    initialize_eye_servos()
+    
+    # Abrir párpados
+    initialize_eyelids()
+    
+    # ✅ CAMBIO: Solo verificar que la cámara esté inicializada
+    if camera_initialized:
+        eyes_active = True
+        
+        # Iniciar hilo de seguimiento
+        eyes_tracking_thread = EyeTrackingThread()
+        eyes_tracking_thread.start()
+        
+        print("✅ [EYES] Sistema de ojos completamente activado")
+    else:
+        print("❌ [EYES] Error: Cámara no inicializada")
+
+def deactivate_eyes():
+    """✅ Desactivar sistema completo de ojos"""
+    global eyes_active, eyes_tracking_thread
+    
+    if not eyes_active:
+        print("[EYES] Sistema de ojos ya está desactivado")
+        return
+    
+    print("😴 [EYES] Desactivando sistema de ojos...")
+    
+    eyes_active = False
+    
+    # Detener hilo de seguimiento
+    if eyes_tracking_thread:
+        eyes_tracking_thread.stop()
+        eyes_tracking_thread.join(timeout=2)
+        eyes_tracking_thread = None
+    
+    # ✅ CAMBIO: NO apagar la cámara, solo centrar ojos y cerrar párpados
+    center_eyes()
+    time.sleep(0.5)  # Dar tiempo para el movimiento
+    close_eyelids()
+    
+    print("✅ [EYES] Sistema de ojos desactivado")
+
+def shutdown_camera_system():
+    """✅ Apagar sistema de cámara completamente"""
+    global picam2, imx500, camera_initialized
+    
+    try:
+        if picam2:
+            picam2.stop()
+            picam2 = None
+        imx500 = None
+        camera_initialized = False
+        print("📷 [EYES] Sistema de cámara apagado completamente")
+    except Exception as e:
+        print(f"[EYES ERROR] Error apagando cámara: {e}")
+
+class EyeTrackingThread(threading.Thread):
+    """✅ Hilo para seguimiento facial en segundo plano"""
+    
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stop_event = threading.Event()
+        
+    def stop(self):
+        self.stop_event.set()
+        
+    def run(self):
+        global previous_lr, previous_ud
+        
+        print("🚀 [EYES] Seguimiento facial activado")
+        print(f"📊 [EYES] Usando threshold: {THRESHOLD}")
+        print(f"👁️ [EYES] Probabilidad de parpadeo: {BLINK_PROBABILITY*100:.1f}%")
+        print(f"👀 [EYES] Probabilidad de mirada curiosa: {RANDOM_LOOK_PROBABILITY*100:.1f}%")
+        print(f"😑 [EYES] Probabilidad de entrecerrar: {SQUINT_PROBABILITY*100:.1f}%")
+        print(f"🫁 [EYES] Respiración en párpados: {'✅' if BREATHING_ENABLED else '❌'}")
+
+        iteration = 0
+        consecutive_no_outputs = 0
+        last_breathing_update = time.time()
+        
+        # ✅ CORRECCIÓN: Obtener labels una sola vez como en ojopipa3.py
+        intrinsics = imx500.network_intrinsics or NetworkIntrinsics()
+        if not hasattr(intrinsics, 'labels') or not intrinsics.labels:
+            intrinsics.labels = ["face"]
+        
+        while not self.stop_event.is_set() and eyes_active:
+            try:
+                iteration += 1
+                
+                # Actualizar respiración en párpados cada cierto tiempo
+                if time.time() - last_breathing_update > 0.2:  # Cada 200ms
+                    update_eyelids_with_breathing()
+                    last_breathing_update = time.time()
+                
+                # Verificar comportamientos aleatorios
+                if should_blink():
+                    blink()
+                elif should_squint():
+                    squint()
+                elif should_look_random():
+                    look_random()
+                
+                # Captura con timeout
+                if not picam2 or not imx500:
+                    time.sleep(0.1)
+                    continue
+                    
+                try:
+                    metadata = picam2.capture_metadata(wait=True)
+                except Exception as e:
+                    print(f"[EYES {iteration}] Error capturando metadata: {e}")
+                    time.sleep(0.1)
+                    continue
+                    
+                outputs = imx500.get_outputs(metadata, add_batch=True)
+
+                if outputs is None:
+                    consecutive_no_outputs += 1
+                    if consecutive_no_outputs % 20 == 0:
+                        print(f"[EYES {iteration}] No outputs (consecutivos: {consecutive_no_outputs})")
+                    
+                    if consecutive_no_outputs > 100:
+                        print("⚠️ [EYES] Demasiados fallos, reiniciando...")
+                        time.sleep(1)
+                        consecutive_no_outputs = 0
+                    else:
+                        time.sleep(0.05)
+                    continue
+                
+                consecutive_no_outputs = 0
+
+                detections = process_detections(outputs, threshold=THRESHOLD)
+                # ✅ CORRECCIÓN QUIRÚRGICA: Usar intrinsics local como en ojopipa3.py
+                faces = [d for d in detections if intrinsics.labels[d["class_id"]] == "face"]
+
+                if not faces:
+                    if iteration % 40 == 0:
+                        print(f"[EYES {iteration}] Sin caras detectadas")
+                    time.sleep(0.1)
+                    continue
+
+                best = max(faces, key=lambda d: d["confidence"])
+                x1, y1, x2, y2 = best["bbox"]
+                x_center = (x1 + x2) / 2
+                y_center = (y1 + y2) / 2
+
+                input_width, input_height = imx500.get_input_size()
+
+                # Calcular ángulos objetivo
+                target_lr = map_range(x_center, 0, input_width, LR_MAX, LR_MIN)
+                target_lr = max(LR_MIN, min(LR_MAX, target_lr))
+                
+                target_ud = map_range(y_center, 0, input_height, UD_MAX, UD_MIN)
+                target_ud = max(UD_MIN, min(UD_MAX, target_ud))
+                
+                # Aplicar suavizado y micro-movimientos
+                smooth_lr = smooth_movement(previous_lr, target_lr, SMOOTHING_FACTOR)
+                smooth_ud = smooth_movement(previous_ud, target_ud, SMOOTHING_FACTOR)
+                
+                final_lr = add_micro_movement(smooth_lr)
+                final_ud = add_micro_movement(smooth_ud)
+                
+                # Aplicar límites finales
+                final_lr = max(LR_MIN, min(LR_MAX, final_lr))
+                final_ud = max(UD_MIN, min(UD_MAX, final_ud))
+
+                # Mover servos
+                if kit and eyes_active:
+                    try:
+                        kit.servo[SERVO_CHANNEL_LR].angle = final_lr
+                        kit.servo[SERVO_CHANNEL_UD].angle = final_ud
+                        
+                        # Actualizar posiciones anteriores
+                        previous_lr = final_lr
+                        previous_ud = final_ud
+
+                    
+                    except Exception as e:
+                        print(f"[EYES ERROR] Error moviendo servos: {e}")
+
+                time.sleep(0.05)  # 20 FPS aproximadamente
+                
+            except Exception as e:
+                print(f"[EYES ERROR] Error en hilo de seguimiento: {e}")
+                time.sleep(0.1)
+
+        print("🛑 [EYES] Hilo de seguimiento facial detenido")
+
+def activate_eyes():
+    """✅ Activar sistema completo de ojos"""
+    global eyes_active, eyes_tracking_thread
+    
+    if eyes_active:
+        print("[EYES] Sistema de ojos ya está activo")
+        return
+    
+    print("👁️ [EYES] Activando sistema de ojos...")
+    
+    # Inicializar servos de movimiento
+    initialize_eye_servos()
+    
+    # Abrir párpados
+    initialize_eyelids()
+    
+    # ✅ CAMBIO: Solo verificar que la cámara esté inicializada
+    if camera_initialized:
+        eyes_active = True
+        
+        # Iniciar hilo de seguimiento
+        eyes_tracking_thread = EyeTrackingThread()
+        eyes_tracking_thread.start()
+        
+        print("✅ [EYES] Sistema de ojos completamente activado")
+    else:
+        print("❌ [EYES] Error: Cámara no inicializada")
+
+def deactivate_eyes():
+    """✅ Desactivar sistema completo de ojos"""
+    global eyes_active, eyes_tracking_thread
+    
+    if not eyes_active:
+        print("[EYES] Sistema de ojos ya está desactivado")
+        return
+    
+    print("😴 [EYES] Desactivando sistema de ojos...")
+    
+    eyes_active = False
+    
+    # Detener hilo de seguimiento
+    if eyes_tracking_thread:
+        eyes_tracking_thread.stop()
+        eyes_tracking_thread.join(timeout=2)
+        eyes_tracking_thread = None
+    
+    # ✅ CAMBIO: NO apagar la cámara, solo centrar ojos y cerrar párpados
+    center_eyes()
+    time.sleep(0.5)  # Dar tiempo para el movimiento
+    close_eyelids()
+    
+    print("✅ [EYES] Sistema de ojos desactivado")
+
+def shutdown_camera_system():
+    """✅ Apagar sistema de cámara completamente"""
+    global picam2, imx500, camera_initialized
+    
+    try:
+        if picam2:
+            picam2.stop()
+            picam2 = None
+        imx500 = None
+        camera_initialized = False
+        print("📷 [EYES] Sistema de cámara apagado completamente")
+    except Exception as e:
+        print(f"[EYES ERROR] Error apagando cámara: {e}")
+
+class EyeTrackingThread(threading.Thread):
+    """✅ Hilo para seguimiento facial en segundo plano"""
+    
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stop_event = threading.Event()
+        
+    def stop(self):
+        self.stop_event.set()
+        
+    def run(self):
+        global previous_lr, previous_ud
+        
+        print("🚀 [EYES] Seguimiento facial activado")
+        print(f"📊 [EYES] Usando threshold: {THRESHOLD}")
+        print(f"👁️ [EYES] Probabilidad de parpadeo: {BLINK_PROBABILITY*100:.1f}%")
+        print(f"👀 [EYES] Probabilidad de mirada curiosa: {RANDOM_LOOK_PROBABILITY*100:.1f}%")
