@@ -1,11 +1,12 @@
+#!/usr/bin/env python3
 # grok3_waveshare_lib_fixed.py
 # Script del androide discutidor con wake word, Vosk, ChatGPT y Piper
-# Visualización avanzada: multi‑onda estilo “Proyecto‑M retro” (ecos, color dinámico)
+# Visualización avanzada: multi‑onda estilo "Proyecto‑M retro" (ecos, color dinámico)
 # Pantalla Waveshare 1.9" en landscape (320×170)
 # Versión 2025‑04‑26‑d
-# ‑ Corrección de muestreo (22 050 Hz)                ✅
-# ‑ Hilo de visualización separado                   ✅
-# ‑ Nueva visualización multi‑onda con color volumen ✅
+# ‑ Corrección de muestreo (22 050 Hz)                ✅
+# ‑ Hilo de visualización separado                   ✅
+# ‑ Nueva visualización multi‑onda con color volumen ✅
 
 import os
 import subprocess
@@ -24,6 +25,7 @@ from pydub import AudioSegment
 import io
 import threading
 import queue
+from google.cloud import speech
 
 # — Librería Waveshare —
 from lib import LCD_1inch9  # Asegúrate de que la carpeta "lib" esté junto al script
@@ -37,6 +39,19 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # Configuración ElevenLabs
 eleven = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 VOICE_ID = 'RnKqZYEeVQciORlpiCz0'
+
+# --- NUEVO: Configuración Google STT ---
+# Nota: Asegúrate de que la variable de entorno GOOGLE_APPLICATION_CREDENTIALS
+# esté configurada en tu archivo .env y apunte a tu fichero de credenciales JSON.
+try:
+    speech_client = speech.SpeechClient()
+    STT_RATE = 16000
+    STT_CHUNK = int(STT_RATE / 10)  # 100ms de audio por paquete
+    print("[INFO] Cliente de Google STT inicializado correctamente.")
+except Exception as e:
+    print(f"[ERROR] No se pudo inicializar Google STT. Verifica tus credenciales: {e}")
+    speech_client = None
+
 # Rutas y configuración Vosk ‑ Piper
 VOSK_MODEL_PATH = "model"
 
@@ -68,7 +83,6 @@ def init_display():
     disp.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
     disp.bl_DutyCycle(100)          # apaga el back-light
     return disp
-
 
 try:
     display = init_display()
@@ -168,7 +182,7 @@ class WildWaveVisualizer(threading.Thread):
         self.level_raw = 0.0
         self.level     = 0.0   # nivel suavizado
 
-        # senoide plantilla (se irá haciendo “scroll” con np.roll)
+        # senoide plantilla (se irá haciendo "scroll" con np.roll)
         self.base_wave = (
             np.sin(2 * np.pi * np.arange(WIDTH) / self.WAVELENGTH) * self.BASE_AMPL
         ).astype(np.float32)
@@ -229,6 +243,7 @@ class WildWaveVisualizer(threading.Thread):
 
         # limpiar al salir
         self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+
 class ElegantWaveVisualizer(threading.Thread):
     """
     Senoide que se desplaza + cambia de tamaño según el RMS.
@@ -295,6 +310,7 @@ class ElegantWaveVisualizer(threading.Thread):
             last = now
 
         self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+
 class BrutusVisualizer(threading.Thread):
     """
     Brutus ⇒ onda azul que se desplaza continuamente + distorsión naranja según volumen.
@@ -377,6 +393,102 @@ class BrutusVisualizer(threading.Thread):
 
         self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
 
+# =============================================
+# --- NUEVO: CLASE PARA STREAMING DE MICRÓFONO A GOOGLE ---
+# =============================================
+class MicrophoneStream:
+    """Clase que abre un stream de micrófono con PyAudio y lo ofrece como un generador."""
+    def __init__(self, rate, chunk):
+        self._rate = rate
+        self._chunk = chunk
+        self._buff = queue.Queue()
+        self.closed = True
+
+    def __enter__(self):
+        self._audio_interface = pyaudio.PyAudio()
+        self._audio_stream = self._audio_interface.open(
+            format=pyaudio.paInt16,
+            channels=1, rate=self._rate,
+            input=True, frames_per_buffer=self._chunk,
+            stream_callback=self._fill_buffer,
+        )
+        self.closed = False
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self._audio_stream.stop_stream()
+        self._audio_stream.close()
+        self.closed = True
+        self._buff.put(None)
+        self._audio_interface.terminate()
+
+    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+        self._buff.put(in_data)
+        return None, pyaudio.paContinue
+
+    def generator(self):
+        while not self.closed:
+            chunk = self._buff.get()
+            if chunk is None:
+                return
+            data = [chunk]
+            while True:
+                try:
+                    chunk = self._buff.get(block=False)
+                    if chunk is None:
+                        return
+                    data.append(chunk)
+                except queue.Empty:
+                    break
+            yield b"".join(data)
+
+# =============================================
+# --- NUEVO: FUNCIÓN DE ESCUCHA CON GOOGLE STT ---
+# =============================================
+def listen_for_command_google() -> str | None:
+    """
+    Activa el micrófono, escucha una única frase del usuario con Google STT
+    y devuelve la transcripción. Se detiene automáticamente tras un silencio.
+    """
+    if not speech_client:
+        print("[ERROR] El cliente de Google STT no está disponible.")
+        time.sleep(2)
+        return None
+
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=STT_RATE,
+        language_code="es-ES"
+    )
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=config,
+        interim_results=False,
+        single_utterance=True  # <-- Clave: se detiene al detectar el final de una frase.
+    )
+
+    with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
+        audio_generator = stream.generator()
+        requests = (
+            speech.StreamingRecognizeRequest(audio_content=content)
+            for content in audio_generator
+        )
+
+        print("[INFO] Escuchando comando con Google STT...")
+        try:
+            # El timeout gestiona el caso de que no se diga nada.
+            responses = speech_client.streaming_recognize(streaming_config, requests, timeout=8.0)
+            
+            for response in responses:
+                if response.results and response.results[0].alternatives:
+                    return response.results[0].alternatives[0].transcript.strip()
+
+        except Exception as e:
+            if "Deadline" in str(e):
+                print("[INFO] Google STT ha agotado el tiempo de espera (silencio).")
+            else:
+                print(f"[ERROR] Excepción en Google STT: {e}")
+
+    return None
 
 # =============================================
 # Vosk y audio
@@ -392,9 +504,8 @@ def init_vosk():
 audio_queue = []
 is_speaking = False
 
-
 def hablar(texto: str):
-    """Sintetiza con ElevenLabs, reproduce a 22 050 Hz y envía niveles RMS al visualizador."""
+    """Sintetiza con ElevenLabs, reproduce a 22 050 Hz y envía niveles RMS al visualizador."""
     global is_speaking
     is_speaking = True
 
@@ -456,6 +567,7 @@ def hablar(texto: str):
             vis_thread.stop()
             vis_thread.join()
         is_speaking = False
+
 def hablar_sin_visualizacion(texto: str):
     global is_speaking
     is_speaking = True
@@ -468,7 +580,6 @@ def hablar_sin_visualizacion(texto: str):
     finally:
         is_speaking = False
 
-
 # ---------- Callback de audio ----------
 
 def audio_callback(indata, frames, time_info, status):
@@ -477,11 +588,9 @@ def audio_callback(indata, frames, time_info, status):
     if not is_speaking:
         audio_queue.append(bytes(indata))
 
-
 # =============================================
 # Bucle principal
 # =============================================
-
 def main():
     model = init_vosk()
     recognizer = vosk.KaldiRecognizer(model, MIC_RATE)
@@ -494,79 +603,96 @@ def main():
         callback=audio_callback,
     )
 
-    print("Esperando la palabra clave 'botijo'…")
-    INACTIVITY_TIMEOUT = 120
-    WARNING_TIME = 90
-    has_warned = False
-    is_conversation_active = False
-    last_interaction_time = time.time()
-
     conversation_history = [
         {
             "role": "system",
             "content": "Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo.",
         }
     ]
-
+    
+    # --- Variables para controlar el estado y el timeout de la conversación ---
+    is_conversation_active = False
+    last_interaction_time = time.time()
+    INACTIVITY_TIMEOUT = 120  # 2 minutos para desactivarse por inactividad
+    WARNING_TIME = 90       # 90 segundos para un aviso de inactividad
+    has_warned = False
+    
     with stream:
         try:
             while True:
-                now = time.time()
-                inactive = now - last_interaction_time
-
-                if audio_queue and not is_speaking:
-                    audio_data = audio_queue.pop(0)
-                    if recognizer.AcceptWaveform(audio_data):
-                        text = json.loads(recognizer.Result()).get("text", "").lower()
-                        if not text:
-                            continue
-
-                        if "botijo" in text or is_conversation_active:
-                            last_interaction_time = now
-                            if not is_conversation_active:
-                                print("\n¡Botijo activado! Iniciando conversación…")
-                                hablar("¿Qué quieres ahora, ser inferior?")
-                                is_conversation_active = True
-                                audio_queue.clear(); recognizer.Reset(); continue
-
-                            if text != "botijo":
-                                print(f"\nHumano: {text}")
-                                conversation_history.append({"role": "user", "content": text})
-                                try:
-                                    response = client.chat.completions.create(
-                                        model="gpt-4-1106-preview",
-                                        messages=conversation_history,
-                                        temperature=0.9,
-                                        max_tokens=150,
-                                        timeout=15,
-                                    )
-                                    respuesta = response.choices[0].message.content
-                                except Exception as e:
-                                    print(f"[CHATGPT] {e}"); respuesta = "Mis circuitos están fritos. Pregunta otra cosa."
-
-                                conversation_history.append({"role": "assistant", "content": respuesta})
-                                conversation_history = conversation_history[-10:]
-                                print(f"Androide: {respuesta}")
-                                hablar(respuesta)
-                                audio_queue.clear(); recognizer.Reset()
-
+                # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
                 if is_conversation_active:
-                    if inactive > INACTIVITY_TIMEOUT:
-                        hablar("Me aburres, humano. Vuelve cuando tengas algo interesante que decir.")
-                        is_conversation_active = False; has_warned = False
+                    inactive_time = time.time() - last_interaction_time
+
+                    if inactive_time > INACTIVITY_TIMEOUT:
+                        print("\n[INFO] Desactivado por inactividad.")
+                        hablar("Me aburres, humano. Vuelve a llamarme si tienes algo interesante que decir.")
+                        is_conversation_active = False
+                        has_warned = False
                         conversation_history = [conversation_history[0]]
-                        audio_queue.clear(); recognizer.Reset()
-                    elif inactive > WARNING_TIME and not has_warned:
+                        audio_queue.clear()
+                        recognizer.Reset()
+                        continue
+
+                    elif inactive_time > WARNING_TIME and not has_warned:
                         hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
-                        has_warned = True; last_interaction_time = time.time()
-                        audio_queue.clear(); recognizer.Reset()
+                        has_warned = True
+
+                # --- LÓGICA DE ESCUCHA ---
+                if is_conversation_active:
+                    # --- FASE DE COMANDO (GOOGLE STT) ---
+                    stream.stop()
+                    command_text = listen_for_command_google()
+                    stream.start()
+
+                    if command_text:
+                        last_interaction_time = time.time()
+                        has_warned = False
+                        
+                        print(f"\nHumano: {command_text}")
+                        conversation_history.append({"role": "user", "content": command_text})
+                        try:
+                            response = client.chat.completions.create(
+                                model="gpt-4-1106-preview",
+                                messages=conversation_history,
+                                temperature=0.9,
+                                max_tokens=150,
+                                timeout=15
+                            )
+                            respuesta = response.choices[0].message.content
+                        except Exception as e:
+                            print(f"[CHATGPT] {e}")
+                            respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
+
+                        conversation_history.append({"role": "assistant", "content": respuesta})
+                        conversation_history = conversation_history[-10:]
+                        print(f"Androide: {respuesta}")
+                        hablar(respuesta)
+                        audio_queue.clear()
+                        recognizer.Reset()
+
+                else:
+                    # --- FASE DE WAKE WORD (VOSK) ---
+                    if not is_speaking and audio_queue:
+                        audio_data = audio_queue.pop(0)
+                        if recognizer.AcceptWaveform(audio_data):
+                            text = json.loads(recognizer.Result()).get("text", "").lower()
+                            if "botijo" in text:
+                                is_conversation_active = True
+                                last_interaction_time = time.time()
+                                has_warned = False
+                                print("\n¡Botijo activado! Modo conversación iniciado...")
+                                hablar("¿Qué quieres ahora, ser inferior?")
+                                audio_queue.clear()
+                                recognizer.Reset()
 
                 time.sleep(0.05)
 
         except KeyboardInterrupt:
             print("\nApagando…")
         finally:
-            stream.stop(); stream.close()
+            stream.stop()
+            stream.close()
             if display:
                 try:
                     display.module_exit()
@@ -574,6 +700,8 @@ def main():
                     pass
             print("Sistema detenido.")
 
-
 if __name__ == "__main__":
-    main()
+    if speech_client:
+        main()
+    else:
+        print("\nEl programa no puede continuar porque Google STT no se inicializó. Revisa las credenciales.")

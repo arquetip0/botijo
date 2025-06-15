@@ -15,7 +15,7 @@ class AnimatronicEyes:
             "LR": 0, "UD": 1, "TL": 2, "BL": 3, "TR": 4, "BR": 5
         }
         self.servo_limits = {
-            "LR": (40, 140), "UD": (70, 120),
+            "LR": (40, 140), "UD": (40, 140),
             "TL": (90, 10), "BL": (90, 145),
             "TR": (90, 180), "BR": (90, 35)
         }
@@ -33,6 +33,11 @@ class AnimatronicEyes:
         self.current_lr = 90
         self.current_ud = 110
         self.current_blink = 0.0
+        
+        # ✅ Variables para tracking de cambios de ángulo
+        self.previous_angles = {
+            "LR": 90, "UD": 110, "TL": 10, "BL": 160, "TR": 180, "BR": 20
+        }
 
         self._initialize_servos()
 
@@ -50,6 +55,7 @@ class AnimatronicEyes:
             self.kit.servo[i].set_pulse_width_range(500, 2500)
         for channel, angle in [("LR", 90), ("UD", 110), ("TL", 10), ("BL", 160), ("TR", 180), ("BR", 20)]:
             self.kit.servo[self.SERVO_CHANNELS[channel]].angle = angle
+            print(f"🔧 [INIT] Servo {channel} inicializado → {angle}°")
 
     def normalize_axis(self, value, min_val=-32768, max_val=32767):
         norm = (value - min_val) / (max_val - min_val)
@@ -95,12 +101,6 @@ class AnimatronicEyes:
                     self.controller_connected = False
                     gamepad = None
             time.sleep(0.5)
-            
-                
-            
-            
-
-
 
     def update(self):
         if self.auto_mode:
@@ -130,20 +130,54 @@ class AnimatronicEyes:
             self.shutdown()
 
     def _apply_servo_positions(self):
-        self.kit.servo[self.SERVO_CHANNELS["LR"]].angle = self.current_lr
-        self.kit.servo[self.SERVO_CHANNELS["UD"]].angle = self.current_ud
+        # ✅ Aplicar y reportar cambios en LR y UD
+        self._set_servo_with_report("LR", self.current_lr)
+        self._set_servo_with_report("UD", self.current_ud)
 
         if self.auto_mode:
             for lid in ["TL", "BL", "TR", "BR"]:
                 a = self.servo_limits[lid][1] + self.current_blink * (self.servo_limits[lid][0] - self.servo_limits[lid][1])
-                self.kit.servo[self.SERVO_CHANNELS[lid]].angle = max(0, min(180, a))
+                a = max(0, min(180, a))
+                self._set_servo_with_report(lid, a)
         else:
             for lid in ["TL", "BL"]:
                 a = self.servo_limits[lid][1] + self.lid_left_trigger * (self.servo_limits[lid][0] - self.servo_limits[lid][1])
-                self.kit.servo[self.SERVO_CHANNELS[lid]].angle = max(0, min(180, a))
+                a = max(0, min(180, a))
+                self._set_servo_with_report(lid, a)
             for lid in ["TR", "BR"]:
                 a = self.servo_limits[lid][1] + self.lid_right_trigger * (self.servo_limits[lid][0] - self.servo_limits[lid][1])
-                self.kit.servo[self.SERVO_CHANNELS[lid]].angle = max(0, min(180, a))
+                a = max(0, min(180, a))
+                self._set_servo_with_report(lid, a)
+
+    def _set_servo_with_report(self, channel, angle):
+        """
+        ✅ Aplica el ángulo al servo y reporta cambios en consola
+        """
+        # Redondear para evitar spam de cambios microscópicos
+        rounded_angle = round(angle, 1)
+        
+        # Solo reportar si hay un cambio significativo (>= 1 grado)
+        if abs(rounded_angle - self.previous_angles.get(channel, 0)) >= 1.0:
+            # Aplicar el ángulo al servo
+            self.kit.servo[self.SERVO_CHANNELS[channel]].angle = rounded_angle
+            
+            # Reportar el cambio
+            servo_names = {
+                "LR": "Izquierda-Derecha", 
+                "UD": "Arriba-Abajo",
+                "TL": "Párpado Superior Izq", 
+                "BL": "Párpado Inferior Izq",
+                "TR": "Párpado Superior Der", 
+                "BR": "Párpado Inferior Der"
+            }
+            
+            print(f"🎯 Servo {channel} ({servo_names.get(channel, channel)}) → {rounded_angle}°")
+            
+            # Actualizar el ángulo previo
+            self.previous_angles[channel] = rounded_angle
+        else:
+            # Aplicar el ángulo sin reportar
+            self.kit.servo[self.SERVO_CHANNELS[channel]].angle = rounded_angle
 
     def shutdown(self):
         self.exit_flag = True
@@ -159,9 +193,11 @@ SERVO_CHANNELS = {
 }
 
 def set_angle(eje, valor):
+    """✅ Función externa con reporte de cambios"""
     if eje in SERVO_CHANNELS:
         kit.servo[SERVO_CHANNELS[eje]].angle = valor
-        print(f"[SERVO] {eje} → {valor}°")
+        servo_names = {"LR": "Izquierda-Derecha", "UD": "Arriba-Abajo"}
+        print(f"🎯 [SERVO] {eje} ({servo_names.get(eje, eje)}) → {valor}°")
     else:
         raise ValueError(f"Eje desconocido: {eje}")
 
