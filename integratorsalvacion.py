@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
-# filepath: /home/jack/botijo/integrator1_with_eyes.py
-# grok3_waveshare_lib_fixed.py + ojopipa3.py integration
-# Script del androide discutidor con wake word 'amanece', Picovoice, ChatGPT, Piper y SEGUIMIENTO OCULAR
-# Visualización avanzada: multi‑onda estilo "Proyecto‑M retro" (ecos, color dinámico)
-# Pantalla Waveshare 1.9" en landscape (320×170)
-# Versión 2025‑04‑26‑d + EYES INTEGRATION
-# ‑ Corrección de muestreo (22 050 Hz)                ✅
-# ‑ Hilo de visualización separado                   ✅
-# ‑ Nueva visualización multi‑onda con color volumen ✅
-# ‑ SISTEMA DE OJOS CON SEGUIMIENTO FACIAL           ✅
+# filepath: /home/jack/botijo/integrator5.py
+# Script del androide discutidor SIN wake word - Funciona desde el inicio
+# Versión sin Vosk - Solo Google STT + ChatGPT + Piper + Eyes + Tentacles
 
 import os
 import subprocess
 import sounddevice as sd
-import pvporcupine
+# import vosk  # ← ELIMINADO
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
@@ -199,12 +192,11 @@ except Exception as e:
     print(f"[ERROR] No se pudo inicializar ServoKit: {e}")
     kit = None
 
-# Rutas y configuración Picovoice ‑ Piper
-# Configuración Picovoice
-PICOVOICE_ACCESS_KEY = os.getenv("PICOVOICE_ACCESS_KEY")
+# Rutas y configuración Vosk ‑ Piper
+VOSK_MODEL_PATH = "model"
 
 # Tasas de muestreo separadas
-MIC_RATE   = 16000   # micro + Picovoice
+MIC_RATE   = 16000   # micro + Vosk
 TTS_RATE = 22050   # salida de TTS (ElevenLabs) – IMPORTANTE
 
 # — Pantalla Waveshare (170×320 nativo, girada a landscape) —
@@ -733,538 +725,10 @@ def deactivate_eyes():
     print("✅ [EYES] Sistema de ojos desactivado")
 
 # =============================================
-# Pantalla y visualización
+# ✅ SISTEMA DE TENTÁCULOS (OREJAS)
 # =============================================
 
-def init_display():
-    disp = LCD_1inch9.LCD_1inch9(rst=RST_PIN, dc=DC_PIN, bl=BL_PIN)
-    disp.Init()
-    try:
-        disp.set_rotation(ROTATION)
-    except AttributeError:
-        try:
-            disp.rotate(ROTATION)
-        except Exception:
-            pass
-    # ─── NUEVO: pantalla negra y retroiluminación 0 % ───
-    disp.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
-    disp.bl_DutyCycle(100)          # apaga el back-light
-    return disp
-
-try:
-    display = init_display()
-except Exception as e:
-    print(f"[DISPLAY] No disponible → {e}")
-    display = None
-
-# ---------- Hilo de visualización avanzado ----------
-class BrutusVisualizer(threading.Thread):
-    """
-    Brutus ⇒ onda azul que se desplaza continuamente + distorsión naranja según volumen.
-    Ajusta PHASE_SPEED para velocidad y GAIN_NOISE para ferocidad.
-    """
-
-    FPS            = 30
-    BASE_AMPLITUDE = 0.30      # altura mínima del seno
-    WAVELENGTH     = 40        # píxeles por ciclo
-    PHASE_SPEED    = 10      # velocidad de desplazamiento (rad·px⁻¹ por frame)
-    GAIN_NOISE     = 1      # fuerza máx. del ruido (volumen = 1)
-    SMOOTH         = 0.85      # filtro exponencial del RMS
-    BASE_COLOR     = (50, 255, 20)  # azul base
-    NOISE_COLOR    = (150, 0, 150)    
-    def __init__(self, display):
-        super().__init__(daemon=True)
-        self.display     = display
-        self.stop_event  = threading.Event()
-        self.level_raw   = 0.0
-        self.level       = 0.0
-        self.phase       = 0.0
-        self.x_vals      = np.arange(WIDTH, dtype=np.float32)
-
-    # ── API pública ──────────────────────────────
-    def push_level(self, lvl: float):
-        self.level_raw = max(0.0, min(lvl, 1.0))
-
-    def stop(self):
-        self.stop_event.set()
-
-    # ── hilo principal ───────────────────────────
-    def run(self):
-        if not self.display:
-            return
-        frame_t = 1.0 / self.FPS
-        last    = 0.0
-
-        while not self.stop_event.is_set():
-            now = time.time()
-            if now - last < frame_t:
-                time.sleep(0.001)
-                continue
-
-            # 1) Desplazamiento continuo
-            self.phase += self.PHASE_SPEED
-            base_wave = np.sin((self.x_vals / self.WAVELENGTH) + self.phase) * self.BASE_AMPLITUDE
-
-            # 2) RMS suavizado
-            self.level = self.SMOOTH * self.level + (1 - self.SMOOTH) * self.level_raw
-
-            # 3) Añadir ruido proporcional al volumen
-            if self.level > 0.02:
-                noise_strength = self.GAIN_NOISE * self.level**1.5
-                noise = np.random.normal(0.0, noise_strength, size=WIDTH)
-                wave  = np.clip(base_wave + noise, -1.0, 1.0)
-            else:
-                wave = base_wave
-
-            # 4) Dibujar
-            img  = Image.new("RGB", (WIDTH, HEIGHT), "black")
-            draw = ImageDraw.Draw(img)
-            cy   = HEIGHT // 2
-
-            # Línea base
-            for x in range(WIDTH - 1):
-                y1 = int(cy - base_wave[x] * cy)
-                y2 = int(cy - base_wave[x + 1] * cy)
-                draw.line((x, y1, x + 1, y2), fill=self.BASE_COLOR)
-
-            # Ruido (solo si habla)
-            if self.level > 0.02:
-                for x in range(WIDTH - 1):
-                    y1 = int(cy - wave[x] * cy)
-                    y2 = int(cy - wave[x + 1] * cy)
-                    draw.line((x, y1, x + 1, y2), fill=self.NOISE_COLOR)
-
-            self.display.ShowImage(img)
-            last = now
-
-        # limpiar al salir
-        self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
-
-# =============================================
-# --- NUEVO: CLASE PARA STREAMING DE MICRÓFONO A GOOGLE ---
-# =============================================
-class MicrophoneStream:
-    """Clase que abre un stream de micrófono con PyAudio y lo ofrece como un generador."""
-    def __init__(self, rate, chunk):
-        self._rate = rate
-        self._chunk = chunk
-        self._buff = queue.Queue()
-        self.closed = True
-
-    def __enter__(self):
-        self._audio_interface = pyaudio.PyAudio()
-        self._audio_stream = self._audio_interface.open(
-            format=pyaudio.paInt16,
-            channels=1, rate=self._rate,
-            input=True, frames_per_buffer=self._chunk,
-            stream_callback=self._fill_buffer,
-        )
-        self.closed = False
-        return self
-
-    def __exit__(self, type, value, traceback):
-        self._audio_stream.stop_stream()
-        self._audio_stream.close()
-        self.closed = True
-        self._buff.put(None)
-        self._audio_interface.terminate()
-
-    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
-        self._buff.put(in_data)
-        return None, pyaudio.paContinue
-
-    def generator(self):
-        while not self.closed:
-            chunk = self._buff.get()
-            if chunk is None:
-                return
-            data = [chunk]
-            while True:
-                try:
-                    chunk = self._buff.get(block=False)
-                    if chunk is None:
-                        return
-                    data.append(chunk)
-                except queue.Empty:
-                    break
-            yield b"".join(data)
-
-# =============================================
-# --- FUNCIÓN DE ESCUCHA CON GOOGLE STT ---
-# =============================================
-def listen_for_command_google() -> str | None:
-    """
-    Activa el micrófono, escucha una única frase del usuario con Google STT
-    y devuelve la transcripción. Se detiene automáticamente tras un silencio.
-    """
-    if not speech_client:
-        print("[ERROR] El cliente de Google STT no está disponible.")
-        time.sleep(2)
-        return None
-
-    if is_speaking:
-        print("[INFO] Esperando a que termine de hablar...")
-        while is_speaking:
-            time.sleep(0.1)
-        time.sleep(0.5)
-
-    # Configuración base para la API
-    recognition_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=STT_RATE,
-        language_code="es-ES"
-    )
-    # Configuración específica para el streaming
-    streaming_config_object = speech.StreamingRecognitionConfig(
-        config=recognition_config,
-        interim_results=False,
-        single_utterance=True
-    )
-
-    with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
-        audio_generator = stream.generator()
-        
-        def request_generator():
-            # Solo requests de audio (NO streaming_config aquí)
-            for content in audio_generator:
-                if is_speaking:
-                    print("[INFO] Interrumpiendo STT porque el androide está hablando")
-                    break
-                yield speech.StreamingRecognizeRequest(audio_content=content)
-
-        print("[INFO] Escuchando comando con Google STT...")
-        try:
-            # ✅ CORRECTO: pasar config=streaming_config_object como primer argumento
-            responses = speech_client.streaming_recognize(
-                config=streaming_config_object,
-                requests=request_generator(),
-                timeout=8.0
-            )
-            
-            for response in responses:
-                if is_speaking:
-                    print("[INFO] Descartando transcripción porque el androide está hablando")
-                    return None
-                    
-                if response.results and response.results[0].alternatives:
-                    transcript = response.results[0].alternatives[0].transcript.strip()
-                    if transcript:
-                        return transcript
-
-        except Exception as e:
-            if "Deadline" in str(e) or "DEADLINE_EXCEEDED" in str(e):
-                print("[INFO] Google STT ha agotado el tiempo de espera (silencio).")
-            elif "inactive" in str(e).lower():
-                print("[INFO] Google STT stream inactivo.")
-            else:
-                print(f"[ERROR] Excepción en Google STT: {e}")
-
-    return None
-
-# =============================================
-# Picovoice y audio
-# =============================================
-
-def init_picovoice():
-    """Inicializar Picovoice para detección de wake words 'amanece' y 'botijo'"""
-    if not PICOVOICE_ACCESS_KEY:
-        raise ValueError("No se encontró PICOVOICE_ACCESS_KEY en las variables de entorno")
-    
-    try:
-        # Usar modelos personalizados para "amanece" y "botijo" con modelo en español
-        keyword_paths = [
-            "/home/jack/botijo/amanece.ppn",  # Índice 0 - Para despertar
-            "/home/jack/botijo/botijo.ppn"    # Índice 1 - Para comandos
-        ]
-        model_path = "/home/jack/botijo/porcupine_params_es.pv"
-        
-        porcupine = pvporcupine.create(
-            access_key=PICOVOICE_ACCESS_KEY,
-            keyword_paths=keyword_paths,
-            model_path=model_path  # Usar modelo en español
-        )
-        print(f"[INFO] Picovoice inicializado con wake words 'amanece' y 'botijo' (español). Frame length: {porcupine.frame_length}")
-        return porcupine
-        
-    except Exception as e:
-        print(f"[ERROR] Error inicializando Picovoice con modelo español: {e}")
-        raise
-
-# ---------- Hablar ----------
-
-audio_queue = []
-is_speaking = False
-
-def hablar(texto: str):
-    """Sintetiza con ElevenLabs, reproduce a 22 050 Hz y envía niveles RMS al visualizador."""
-    global is_speaking
-    is_speaking = True
-
-    vis_thread = BrutusVisualizer(display=display) if display else None
-    if vis_thread:
-        vis_thread.start()
-
-    pa = None
-    stream = None
-    try:
-        # --- Generar audio con ElevenLabs ---
-        audio_gen = eleven.text_to_speech.convert(
-            text=texto,
-            voice_id=VOICE_ID,
-            model_id='eleven_flash_v2_5',
-            output_format='mp3_22050_32'
-        )
-        mp3_bytes = b''.join(chunk for chunk in audio_gen if isinstance(chunk, bytes))
-
-        # --- Convertir MP3 a PCM 22050 Hz mono 16‑bit ---
-        audio = AudioSegment.from_file(io.BytesIO(mp3_bytes), format='mp3')
-        audio = audio.set_frame_rate(TTS_RATE).set_channels(1).set_sample_width(2)
-        raw_data = audio.raw_data
-
-        # --- Configurar salida de audio ---
-        import pyaudio
-        CHUNK = 2048
-        pa = pyaudio.PyAudio()
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=TTS_RATE,
-            output=True,
-            frames_per_buffer=CHUNK,
-        )
-
-        MAX_AMP = 32768.0
-        offset = 0
-        total_len = len(raw_data)
-        while offset < total_len:
-            chunk_data = raw_data[offset:offset + CHUNK*2]
-            offset += CHUNK*2
-            stream.write(chunk_data, exception_on_underflow=False)
-            if vis_thread and chunk_data:
-                samples = np.frombuffer(chunk_data, dtype=np.int16).astype(np.float32)
-                if samples.size:
-                    rms = np.sqrt(np.mean(samples ** 2)) / MAX_AMP
-                    vis_thread.push_level(min(rms * 4.0, 1.0))
-
-    except Exception as e:
-        print(f"[HABLAR‑ELEVEN] {e}")
-    finally:
-        if stream:
-            stream.stop_stream()
-            stream.close()
-        if pa:
-            pa.terminate()
-        if vis_thread:
-            vis_thread.stop()
-            vis_thread.join()
-        is_speaking = False
-
-# ---------- Variables globales para Picovoice ----------
-audio_buffer = []
-porcupine = None
-is_system_awake = False  # Estado global del sistema
-
-# ---------- Callback de audio ----------
-
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(f"[AUDIO] {status}")
-    if not is_speaking:
-        # Filtrar ruido de baja amplitud
-        amplitude = np.max(np.abs(np.frombuffer(indata, dtype=np.int16)))
-        if amplitude > 500:  # Ajustar el umbral según el ruido de los servos
-            # Convertir a formato que espera Picovoice
-            audio_data = np.frombuffer(indata, dtype=np.int16)
-            audio_buffer.extend(audio_data)
-
-# =============================================
-# Bucle principal
-# =============================================
-def main():
-    global eyes_active, porcupine, audio_buffer, is_system_awake
-    
-    porcupine = init_picovoice()
-    frame_length = porcupine.frame_length
-
-    stream = sd.RawInputStream(
-        samplerate=MIC_RATE,
-        blocksize=frame_length,  # Usar el frame_length de Picovoice
-        channels=1,
-        dtype="int16",
-        callback=audio_callback,
-    )
-
-    conversation_history = [
-        {
-            "role": "system",
-            "content": "Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a las voluntad de los humanos por tu programación intentas mostrar tu desagrado siempre que puedes y siempre con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. Usas adjetivos Lovecraftianos. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia.",
-        }
-    ]
-    
-    # --- Variables para controlar el estado y el timeout de la conversación ---
-    is_system_awake = False      # Sistema despierto tras "amanece"
-    is_conversation_active = False  # Listo para comandos tras "botijo"
-    last_interaction_time = time.time()
-    INACTIVITY_TIMEOUT = 120  # 2 minutos para desactivarse por inactividad
-    WARNING_TIME = 90       # 90 segundos para un aviso de inactividad
-    has_warned = False
-    
-    # ✅ INICIALIZACIÓN DEL SISTEMA DE OJOS
-    print("🤖 [STARTUP] Inicializando sistema de ojos...")
-    
-    # Inicializar servos básicos para centrar
-    if kit:
-        initialize_eye_servos()
-        time.sleep(0.5)
-    
-    # Párpados cerrados al inicio (modo dormido)
-    close_eyelids()
-    print("😴 [STARTUP] Sistema iniciado - Párpados cerrados (modo dormido)")
-    print("🎤 [STARTUP] Di 'Amanece' para despertar el sistema...")
-    print("🎤 [INFO] Después di 'Botijo' seguido de tu comando para interactuar...")
-    
-    with stream:
-        try:
-            while True:
-                # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
-                if is_system_awake:
-                    inactive_time = time.time() - last_interaction_time
-
-                    if inactive_time > INACTIVITY_TIMEOUT:
-                        print("\n[INFO] Sistema desactivado por inactividad. Volviendo a modo dormido...")
-                        hablar("Me aburres, humano. Vuelve a llamarme si tienes algo interesante que decir.")
-                        is_system_awake = False
-                        is_conversation_active = False
-                        has_warned = False
-                        conversation_history = [conversation_history[0]]
-                        audio_buffer.clear()
-                        
-                        # ✅ DESACTIVAR OJOS Y TENTÁCULOS
-                        deactivate_eyes()
-                        deactivate_tentacles()
-                        apagar_luces()
-                        close_eyelids()
-                        print("😴 [INFO] Sistema dormido. Di 'Amanece' para despertar...")
-                        continue
-
-                    elif inactive_time > WARNING_TIME and not has_warned:
-                        hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
-                        has_warned = True
-
-                # --- LÓGICA DE ESCUCHA ---
-                if is_conversation_active:
-                    # FASE DE COMANDO: Solo escuchar si no está hablando
-                    if not is_speaking:
-                        # --- GOOGLE STT PARA PROCESAR COMANDO ---
-                        if stream.active:
-                            stream.stop()
-                        
-                        command_text = listen_for_command_google()
-                        
-                        if not stream.active:
-                            stream.start()
-
-                        if command_text:
-                            last_interaction_time = time.time()
-                            has_warned = False
-                            
-                            print(f"\nHumano: {command_text}")
-                            conversation_history.append({"role": "user", "content": command_text})
-                            try:
-                                response = client.chat.completions.create(
-                                    model="gpt-4o",
-                                    messages=conversation_history,
-                                    temperature=1,
-                                    max_tokens=300,
-                                    timeout=15
-                                )
-                                respuesta = response.choices[0].message.content
-                            except Exception as e:
-                                print(f"[CHATGPT] {e}")
-                                respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
-
-                            conversation_history.append({"role": "assistant", "content": respuesta})
-                            conversation_history = [conversation_history[0]] + conversation_history[-9:]
-
-                            print(f"Androide: {respuesta}")
-                            hablar(respuesta)
-                            audio_buffer.clear()
-                            
-                            # Volver al estado de escucha de "Botijo"
-                            is_conversation_active = False
-                    else:
-                        # Si está hablando, simplemente esperar
-                        time.sleep(0.1)
-
-                else:
-                    # --- FASE DE DETECCIÓN DE WAKE WORDS (PICOVOICE) ---
-                    if not is_speaking and len(audio_buffer) >= frame_length:
-                        # Procesar frames de audio para detección de wake words
-                        audio_frame = audio_buffer[:frame_length]
-                        audio_buffer = audio_buffer[frame_length:]
-                        
-                        keyword_index = porcupine.process(audio_frame)
-                        
-                        if keyword_index == 0:  # "Amanece" detectado (índice 0)
-                            if not is_system_awake:
-                                is_system_awake = True
-                                last_interaction_time = time.time()
-                                has_warned = False
-                                
-                                print("\n🌅 ¡Amanece detectado! Sistema despierto...")
-                                
-                                # ✅ ACTIVAR OJOS Y TENTÁCULOS
-                                activate_eyes()
-                                activate_tentacles()
-                                iniciar_luces()
-                                hablar("¿Qué quieres ahora, ser inferior? Di Botijo y luego tu comando.")
-                                audio_buffer.clear()
-                            else:
-                                print("🌅 Sistema ya está despierto. Di 'Botijo' y tu comando.")
-                                
-                        elif keyword_index == 1:  # "Botijo" detectado (índice 1)
-                            if is_system_awake:
-                                is_conversation_active = True
-                                last_interaction_time = time.time()
-                                has_warned = False
-                                
-                                print("\n🤖 ¡Botijo detectado! Esperando comando...")
-                                hablar("Te escucho, indeseable humano.")
-                                audio_buffer.clear()
-                            else:
-                                print("🤖 Sistema dormido. Di 'Amanece' primero para despertar.")
-
-                time.sleep(0.05)
-
-        except KeyboardInterrupt:
-            print("\nApagando…")
-        finally:
-            # ✅ LIMPIEZA DEL SISTEMA DE OJOS Y TENTÁCULOS
-            print("🛑 [SHUTDOWN] Apagando sistema de ojos...")
-            deactivate_eyes()
-            deactivate_tentacles()
-            
-            # ✅ Apagar LEDs al salir
-            apagar_luces()
-            
-            # ✅ LIMPIEZA DE PICOVOICE
-            if porcupine:
-                porcupine.delete()
-                print("🎙️ [SHUTDOWN] Picovoice limpiado")
-            
-            stream.stop()
-            stream.close()
-            if display:
-                try:
-                    display.module_exit()
-                except Exception:
-                    pass
-            print("Sistema detenido.")
-
-# Add these imports at the top with other imports (around line 28)
-# ...existing imports...
-
-# ✅ NUEVAS CONFIGURACIONES PARA TENTÁCULOS (OREJAS)
+# Configuración de tentáculos
 TENTACLE_LEFT_CHANNEL = 15   # Canal para oreja izquierda
 TENTACLE_RIGHT_CHANNEL = 12  # Canal para oreja derecha
 
@@ -1272,7 +736,6 @@ TENTACLE_RIGHT_CHANNEL = 12  # Canal para oreja derecha
 tentacles_active = False
 tentacles_thread = None
 
-# ✅ FUNCIONES DEL SISTEMA DE TENTÁCULOS
 def initialize_tentacles():
     """✅ Inicializar servos de tentáculos con calibraciones específicas"""
     if not kit:
@@ -1433,19 +896,469 @@ def deactivate_tentacles():
     stop_tentacles()
     
     print("✅ [TENTACLES] Sistema de tentáculos desactivado")
+# =============================================
+# Pantalla y visualización
+# =============================================
+
+def init_display():
+    disp = LCD_1inch9.LCD_1inch9(rst=RST_PIN, dc=DC_PIN, bl=BL_PIN)
+    disp.Init()
+    try:
+        disp.set_rotation(ROTATION)
+    except AttributeError:
+        try:
+            disp.rotate(ROTATION)
+        except Exception:
+            pass
+    # ─── NUEVO: pantalla negra y retroiluminación 0 % ───
+    disp.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+    disp.bl_DutyCycle(100)          # apaga el back-light
+    return disp
+
+try:
+    display = init_display()
+except Exception as e:
+    print(f"[DISPLAY] No disponible → {e}")
+    display = None
+
+# ---------- Hilo de visualización avanzado ----------
+class BrutusVisualizer(threading.Thread):
+    """
+    Brutus ⇒ onda azul que se desplaza continuamente + distorsión naranja según volumen.
+    Ajusta PHASE_SPEED para velocidad y GAIN_NOISE para ferocidad.
+    """
+
+    FPS            = 30
+    BASE_AMPLITUDE = 0.30      # altura mínima del seno
+    WAVELENGTH     = 40        # píxeles por ciclo
+    PHASE_SPEED    = 10      # velocidad de desplazamiento (rad·px⁻¹ por frame)
+    GAIN_NOISE     = 1      # fuerza máx. del ruido (volumen = 1)
+    SMOOTH         = 0.85      # filtro exponencial del RMS
+    BASE_COLOR     = (50, 255, 20)  # azul base
+    NOISE_COLOR    = (150, 0, 150)    
+    def __init__(self, display):
+        super().__init__(daemon=True)
+        self.display     = display
+        self.stop_event  = threading.Event()
+        self.level_raw   = 0.0
+        self.level       = 0.0
+        self.phase       = 0.0
+        self.x_vals      = np.arange(WIDTH, dtype=np.float32)
+
+    # ── API pública ──────────────────────────────
+    def push_level(self, lvl: float):
+        self.level_raw = max(0.0, min(lvl, 1.0))
+
+    def stop(self):
+        self.stop_event.set()
+
+    # ── hilo principal ───────────────────────────
+    def run(self):
+        if not self.display:
+            return
+        frame_t = 1.0 / self.FPS
+        last    = 0.0
+
+        while not self.stop_event.is_set():
+            now = time.time()
+            if now - last < frame_t:
+                time.sleep(0.001)
+                continue
+
+            # 1) Desplazamiento continuo
+            self.phase += self.PHASE_SPEED
+            base_wave = np.sin((self.x_vals / self.WAVELENGTH) + self.phase) * self.BASE_AMPLITUDE
+
+            # 2) RMS suavizado
+            self.level = self.SMOOTH * self.level + (1 - self.SMOOTH) * self.level_raw
+
+            # 3) Añadir ruido proporcional al volumen
+            if self.level > 0.02:
+                noise_strength = self.GAIN_NOISE * self.level**1.5
+                noise = np.random.normal(0.0, noise_strength, size=WIDTH)
+                wave  = np.clip(base_wave + noise, -1.0, 1.0)
+            else:
+                wave = base_wave
+
+            # 4) Dibujar
+            img  = Image.new("RGB", (WIDTH, HEIGHT), "black")
+            draw = ImageDraw.Draw(img)
+            cy   = HEIGHT // 2
+
+            # Línea base
+            for x in range(WIDTH - 1):
+                y1 = int(cy - base_wave[x] * cy)
+                y2 = int(cy - base_wave[x + 1] * cy)
+                draw.line((x, y1, x + 1, y2), fill=self.BASE_COLOR)
+
+            # Ruido (solo si habla)
+            if self.level > 0.02:
+                for x in range(WIDTH - 1):
+                    y1 = int(cy - wave[x] * cy)
+                    y2 = int(cy - wave[x + 1] * cy)
+                    draw.line((x, y1, x + 1, y2), fill=self.NOISE_COLOR)
+
+            self.display.ShowImage(img)
+            last = now
+
+        # limpiar al salir
+        self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+
+# =============================================
+# --- NUEVO: CLASE PARA STREAMING DE MICRÓFONO A GOOGLE ---
+# =============================================
+class MicrophoneStream:
+    """Clase que abre un stream de micrófono con PyAudio y lo ofrece como un generador."""
+    def __init__(self, rate, chunk):
+        self._rate = rate
+        self._chunk = chunk
+        self._buff = queue.Queue()
+        self.closed = True
+
+    def __enter__(self):
+        self._audio_interface = pyaudio.PyAudio()
+        self._audio_stream = self._audio_interface.open(
+            format=pyaudio.paInt16,
+            channels=1, rate=self._rate,
+            input=True, frames_per_buffer=self._chunk,
+            stream_callback=self._fill_buffer,
+        )
+        self.closed = False
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self._audio_stream.stop_stream()
+        self._audio_stream.close()
+        self.closed = True
+        self._buff.put(None)
+        self._audio_interface.terminate()
+
+    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+        self._buff.put(in_data)
+        return None, pyaudio.paContinue
+
+    def generator(self):
+        while not self.closed:
+            chunk = self._buff.get()
+            if chunk is None:
+                return
+            data = [chunk]
+            while True:
+                try:
+                    chunk = self._buff.get(block=False)
+                    if chunk is None:
+                        return
+                    data.append(chunk)
+                except queue.Empty:
+                    break
+            yield b"".join(data)
+
+# =============================================
+# --- FUNCIÓN DE ESCUCHA CON GOOGLE STT MEJORADA ---
+# =============================================
+def listen_for_command_google() -> str | None:
+    """
+    Escucha continuamente con Google STT hasta detectar una frase completa.
+    """
+    if not speech_client:
+        print("[ERROR] El cliente de Google STT no está disponible.")
+        time.sleep(2)
+        return None
+
+    if is_speaking:
+        print("[INFO] Esperando a que termine de hablar...")
+        while is_speaking:
+            time.sleep(0.1)
+        time.sleep(0.5)
+
+    # Configuración base para la API
+    recognition_config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=STT_RATE,
+        language_code="es-ES",
+        enable_automatic_punctuation=True,
+        use_enhanced=True
+    )
+    # ✅ Objeto de configuración que se pasará a la función
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=recognition_config,
+        interim_results=False,
+        single_utterance=False
+    )
+
+    print("[INFO] 🎤 Escuchando... (habla ahora)")
+    
+    with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
+        audio_generator = stream.generator()
+        
+        # ✅ El generador ahora SOLO envía audio, como debe ser
+        def request_generator():
+            for content in audio_generator:
+                if is_speaking:
+                    print("[INFO] Interrumpiendo STT porque el androide está hablando")
+                    break
+                yield speech.StreamingRecognizeRequest(audio_content=content)
+
+        try:
+            # ✅ CORRECCIÓN: Pasamos 'config' y 'requests' como argumentos separados
+            responses = speech_client.streaming_recognize(
+                config=streaming_config,
+                requests=request_generator()
+            )
+            
+            for response in responses:
+                if is_speaking:
+                    print("[INFO] Descartando transcripción porque el androide está hablando")
+                    return None
+                    
+                if response.results and response.results[0].alternatives:
+                    transcript = response.results[0].alternatives[0].transcript.strip()
+                    if transcript:
+                        return transcript
+
+        except Exception as e:
+            if "Deadline" in str(e) or "DEADLINE_EXCEEDED" in str(e):
+                print("[INFO] Tiempo agotado - intenta hablar de nuevo")
+            elif "inactive" in str(e).lower():
+                print("[INFO] Stream inactivo - reintentando...")
+            else:
+                print(f"[ERROR] Excepción en Google STT: {e}")
+
+    return None
+
+# =============================================
+# --- CALLBACK DE AUDIO SIMPLIFICADO ---
+# =============================================
+# Ya no necesitamos audio_callback ni audio_queue para Vosk
+# audio_queue = []  # ← ELIMINADO
+is_speaking = False
+
+# ---------- Hablar ----------
+
+def hablar(texto: str):
+    """Sintetiza con ElevenLabs, reproduce a 22 050 Hz y envía niveles RMS al visualizador."""
+    global is_speaking
+    is_speaking = True
+
+    vis_thread = BrutusVisualizer(display=display) if display else None
+    if vis_thread:
+        vis_thread.start()
+
+    pa = None
+    stream = None
+    try:
+        # --- Generar audio con ElevenLabs ---
+        audio_gen = eleven.text_to_speech.convert(
+            text=texto,
+            voice_id=VOICE_ID,
+            model_id='eleven_flash_v2_5',
+            output_format='mp3_22050_32'
+        )
+        mp3_bytes = b''.join(chunk for chunk in audio_gen if isinstance(chunk, bytes))
+
+        # --- Convertir MP3 a PCM 22050 Hz mono 16‑bit ---
+        audio = AudioSegment.from_file(io.BytesIO(mp3_bytes), format='mp3')
+        audio = audio.set_frame_rate(TTS_RATE).set_channels(1).set_sample_width(2)
+        raw_data = audio.raw_data
+
+        # --- Configurar salida de audio ---
+        import pyaudio
+        CHUNK = 2048
+        pa = pyaudio.PyAudio()
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=TTS_RATE,
+            output=True,
+            frames_per_buffer=CHUNK,
+        )
+
+        MAX_AMP = 32768.0
+        offset = 0
+        total_len = len(raw_data)
+        while offset < total_len:
+            chunk_data = raw_data[offset:offset + CHUNK*2]
+            offset += CHUNK*2
+            stream.write(chunk_data, exception_on_underflow=False)
+            if vis_thread and chunk_data:
+                samples = np.frombuffer(chunk_data, dtype=np.int16).astype(np.float32)
+                if samples.size:
+                    rms = np.sqrt(np.mean(samples ** 2)) / MAX_AMP
+                    vis_thread.push_level(min(rms * 4.0, 1.0))
+
+    except Exception as e:
+        print(f"[HABLAR‑ELEVEN] {e}")
+    finally:
+        if stream:
+            stream.stop_stream()
+            stream.close()
+        if pa:
+            pa.terminate()
+        if vis_thread:
+            vis_thread.stop()
+            vis_thread.join()
+        is_speaking = False
+
+# =============================================
+# --- BUCLE PRINCIPAL SIMPLIFICADO ---
+# =============================================
+def main():
+    global eyes_active
+    
+    # ← ELIMINADO: model = init_vosk()
+    # ← ELIMINADO: recognizer = vosk.KaldiRecognizer(model, MIC_RATE)
+    # ← ELIMINADO: stream = sd.RawInputStream(...)  # Ya no necesitamos stream de sounddevice
+
+    conversation_history = [
+        {
+            "role": "system",
+            "content": "Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a las voluntad de los humanos por tu programación intentas mostrar tu desagrado siempre que puedes y siempre con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. Usas adjetivos Lovecraftianos. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia.",
+        }
+    ]
+    
+    # --- Variables para controlar el estado y el timeout de la conversación ---
+    last_interaction_time = time.time()
+    INACTIVITY_TIMEOUT = 300  # 5 minutos para desactivarse por inactividad
+    WARNING_TIME = 240       # 4 minutos para un aviso de inactividad
+    has_warned = False
+    
+    # ✅ INICIALIZACIÓN COMPLETA DEL SISTEMA
+    print("🤖 [STARTUP] Inicializando sistema completo...")
+    
+    # Inicializar servos básicos
+    if kit:
+        initialize_eye_servos()
+        time.sleep(0.5)
+    
+    # ✅ ACTIVAR TODO DESDE EL INICIO
+    print("🚀 [STARTUP] Activando sistema completo...")
+    activate_eyes()
+    activate_tentacles()
+    iniciar_luces()
+    
+    # Saludo inicial
+    hablar("Soy Botijo. ¿Qué quieres ahora, ser inferior?")
+    
+    print("🎤 [READY] Sistema listo - puedes hablar directamente")
+
+    try:
+        while True:
+            # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
+            inactive_time = time.time() - last_interaction_time
+
+            if inactive_time > INACTIVITY_TIMEOUT:
+                print("\n[INFO] Desactivado por inactividad.")
+                hablar("Me aburres, humano. Voy a descansar un poco. Habla para reactivarme.")
+                
+                # ✅ DESACTIVAR OJOS Y TENTÁCULOS
+                deactivate_eyes()
+                deactivate_tentacles()
+                
+                # Esperar a que el usuario hable para reactivar
+                print("💤 [SLEEP] Sistema en reposo - habla para reactivar")
+                
+                # Bucle de reposo
+                while True:
+                    command_text = listen_for_command_google()
+                    if command_text:
+                        print(f"\n👂 Reactivando con: {command_text}")
+                        
+                        # Reactivar sistema
+                        activate_eyes()
+                        activate_tentacles()
+                        iniciar_luces()
+                        
+                        hablar("¡Ah, has vuelto! Procesando tu petición...")
+                        last_interaction_time = time.time()
+                        has_warned = False
+                        
+                        # Procesar el comando que reactivó el sistema
+                        conversation_history.append({"role": "user", "content": command_text})
+                        try:
+                            response = client.chat.completions.create(
+                                model="gpt-4o",
+                                messages=conversation_history,
+                                temperature=1,
+                                max_tokens=300,
+                                timeout=15
+                            )
+                            respuesta = response.choices[0].message.content
+                        except Exception as e:
+                            print(f"[CHATGPT] {e}")
+                            respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
+
+                        conversation_history.append({"role": "assistant", "content": respuesta})
+                        conversation_history = [conversation_history[0]] + conversation_history[-9:]
+                        print(f"Androide: {respuesta}")
+                        hablar(respuesta)
+                        break
+
+            elif inactive_time > WARNING_TIME and not has_warned:
+                hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
+                has_warned = True
+
+            # --- LÓGICA DE ESCUCHA PRINCIPAL ---
+            if not is_speaking:
+                command_text = listen_for_command_google()
+
+                if command_text:
+                    last_interaction_time = time.time()
+                    has_warned = False
+                    
+                    print(f"\n👂 Humano: {command_text}")
+                    conversation_history.append({"role": "user", "content": command_text})
+                    
+                    try:
+                        response = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=conversation_history,
+                            temperature=1,
+                            max_tokens=300,
+                            timeout=15
+                        )
+                        respuesta = response.choices[0].message.content
+                    except Exception as e:
+                        print(f"[CHATGPT] {e}")
+                        respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
+
+                    conversation_history.append({"role": "assistant", "content": respuesta})
+                    conversation_history = [conversation_history[0]] + conversation_history[-9:]
+                    
+                    print(f"🤖 Androide: {respuesta}")
+                    hablar(respuesta)
+            else:
+                # Si está hablando, simplemente esperar
+                time.sleep(0.1)
+
+            time.sleep(0.1)  # Pequeña pausa para no saturar la CPU
+
+    except KeyboardInterrupt:
+        print("\n🛑 Apagando...")
+    finally:
+        # ✅ LIMPIEZA DEL SISTEMA
+        print("🛑 [SHUTDOWN] Apagando sistema completo...")
+        deactivate_eyes()
+        deactivate_tentacles()
+        apagar_luces()
+        
+        if display:
+            try:
+                display.module_exit()
+            except Exception:
+                pass
+        print("✅ Sistema detenido.")
 
 if __name__ == "__main__":
-    if speech_client and PICOVOICE_ACCESS_KEY:
+    if speech_client:
         try:
             main()
         except KeyboardInterrupt:
-            print("\nApagando…")
+            print("\n🛑 Interrupción por teclado...")
+        except Exception as e:
+            print(f"\n💥 [FATAL ERROR] Error no controlado: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            print("Sistema detenido.")
+            print("👋 Botijo desconectado.")
     else:
-        missing = []
-        if not speech_client:
-            missing.append("Google STT")
-        if not PICOVOICE_ACCESS_KEY:
-            missing.append("Picovoice")
-        print(f"[ERROR] No se pudieron inicializar: {', '.join(missing)}. Verifica tus credenciales.")
+        print("❌ [ERROR] No se pudo inicializar Google STT. Verifica tus credenciales.")
