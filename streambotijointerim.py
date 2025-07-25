@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# filepath: /home/jack/botijo/integrator5.py
+# filepath: /home/jack/botijo/integrapruebas.py
 # Script del androide discutidor SIN wake word - Funciona desde el inicio
 # Versión sin Vosk - Solo Google STT + ChatGPT + Piper + Eyes + Tentacles
 
@@ -26,6 +26,9 @@ import math
 import board
 import neopixel
 import threading
+import signal
+import sys
+import atexit
 
 # - Leds Brazo -
 
@@ -55,7 +58,7 @@ def steampunk_danza(delay=0.04):
     t = 0
     glitch_timer = 0
     try:
-        while led_thread_running:
+        while led_thread_running and not system_shutdown:
             for i in range(LED_COUNT):
                 if glitch_timer > 0 and i == random.randint(0, LED_COUNT - 1):
                     pixels[i] = random.choice([(0, 255, 180), (255, 255, 255)])
@@ -82,7 +85,7 @@ def iniciar_luces():
     led_thread.start()
 
 def apagar_luces():
-    """Apaga los LEDs al salir del script."""
+    '''Apaga los LEDs al salir del script.'''
     global led_thread_running, led_thread
     try:
         # Detener el hilo de LEDs
@@ -93,12 +96,12 @@ def apagar_luces():
         # Apagar todos los LEDs
         pixels.fill((0, 0, 0))
         pixels.show()
-        print("[INFO] LEDs apagados.")
+        print('[INFO] LEDs apagados.')
     except Exception as e:
-        print(f"[ERROR] No se pudieron apagar los LEDs: {e}")
+        print(f'[ERROR] No se pudieron apagar los LEDs: {e}')
 
 # — Librería Waveshare —
-from lib import LCD_1inch9  # Asegúrate de que la carpeta "lib" esté junto al script
+from lib import LCD_1inch9  # Asegúrate de que la carpeta 'lib' esté junto al script
 
 # ✅ NUEVAS IMPORTACIONES PARA SISTEMA DE OJOS
 from picamera2 import Picamera2
@@ -110,25 +113,26 @@ from adafruit_servokit import ServoKit
 # Configuración general
 # ========================
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Configuración ElevenLabs
-eleven = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-VOICE_ID = 'RnKqZYEeVQciORlpiCz0'
-
+eleven = ElevenLabs(api_key=os.getenv('ELEVENLABS_API_KEY'))
+VOICE_ID =   'RnKqZYEeVQciORlpiCz0' # 'ByVRQtaK1WDOvTmP1PKO'  #'RnKqZYEeVQciORlpiCz0' voz buena # voz jacobiana '0IvOsEbrz5BR3wpPyKbU'
+TTS_RATE   = 22_050             # Hz
+CHUNK      = 1024               # frames por trozo de audio
 # --- NUEVO: Configuración Google STT ---
 try:
     speech_client = speech.SpeechClient()
     STT_RATE = 16000
     STT_CHUNK = int(STT_RATE / 10)  # 100ms de audio por paquete
-    print("[INFO] Cliente de Google STT inicializado correctamente.")
+    print('[INFO] Cliente de Google STT inicializado correctamente.')
 except Exception as e:
-    print(f"[ERROR] No se pudo inicializar Google STT. Verifica tus credenciales: {e}")
+    print(f'[ERROR] No se pudo inicializar Google STT. Verifica tus credenciales: {e}')
     speech_client = None
 
 # ✅ =================== CONFIGURACIÓN DEL SISTEMA DE OJOS ===================
-RPK_PATH = "/home/jack/botijo/packett/network.rpk"
-LABELS_PATH = "/home/jack/botijo/labels.txt"
+RPK_PATH = '/home/jack/botijo/packett/network.rpk'
+LABELS_PATH = '/home/jack/botijo/labels.txt'
 THRESHOLD = 0.2
 
 SERVO_CHANNEL_LR = 0  # izquierda-derecha
@@ -136,15 +140,15 @@ SERVO_CHANNEL_UD = 1  # arriba-abajo
 
 # Canales de párpados
 SERVO_CHANNELS_EYELIDS = {
-    "TL": 2, "BL": 3, "TR": 4, "BR": 5
+    'TL': 2, 'BL': 3, 'TR': 4, 'BR': 5
 }
 
 # Posiciones de párpados personalizadas
 EYELID_POSITIONS = {
-    "TL": 50,   # Párpado Superior Izq
-    "BL": 155,  # Párpado Inferior Izq  
-    "TR": 135,  # Párpado Superior Der
-    "BR": 25   # Párpado Inferior Der
+    'TL': 50,   # Párpado Superior Izq
+    'BL': 155,  # Párpado Inferior Izq  
+    'TR': 135,  # Párpado Superior Der
+    'BR': 25   # Párpado Inferior Der
 }
 
 LR_MIN, LR_MAX = 40, 140
@@ -184,12 +188,78 @@ eyes_tracking_thread = None
 picam2 = None
 imx500 = None
 
+# ✅ VARIABLES GLOBALES PARA CONTROL DE HILOS Y LIMPIEZA
+system_shutdown = False
+active_visualizer_threads = []
+shutdown_lock = threading.Lock()
+
+def emergency_shutdown():
+    '''✅ Función de limpieza de emergencia para Ctrl+C'''
+    global system_shutdown, eyes_active, tentacles_active, led_thread_running
+    global active_visualizer_threads, display
+    
+    with shutdown_lock:
+        if system_shutdown:
+            return  # Ya se está ejecutando
+        system_shutdown = True
+    
+    print('\n🚨 [EMERGENCY] Iniciando limpieza de emergencia...')
+    
+    # 1. Detener todos los visualizadores activos
+    if active_visualizer_threads:
+        print('🛑 [EMERGENCY] Deteniendo visualizadores...')
+        for vis in active_visualizer_threads[:]:  # Copia para evitar modificación concurrente
+            try:
+                vis.stop()
+            except:
+                pass
+        
+        # Esperar un poco para que se detengan
+        time.sleep(0.3)
+    
+    # 2. Detener sistemas principales
+    try:
+        eyes_active = False
+        tentacles_active = False
+        led_thread_running = False
+    except:
+        pass
+    
+    # 3. Limpiar pantalla de forma segura
+    try:
+        if display:
+            display.ShowImage(Image.new('RGB', (WIDTH, HEIGHT), 'black'))
+            display.module_exit()
+    except:
+        pass
+    
+    # 4. Detener LEDs
+    try:
+        pixels.fill((0, 0, 0))
+        pixels.show()
+    except:
+        pass
+    
+    print('✅ [EMERGENCY] Limpieza completada')
+
+def signal_handler(signum, frame):
+    '''✅ Manejador de señales para Ctrl+C'''
+    emergency_shutdown()
+    sys.exit(0)
+
+# Registrar manejador de señales
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Registrar función de limpieza al salir
+atexit.register(emergency_shutdown)
+
 # Inicializar ServoKit
 try:
     kit = ServoKit(channels=16)
-    print("[INFO] ServoKit inicializado correctamente.")
+    print('[INFO] ServoKit inicializado correctamente.')
 except Exception as e:
-    print(f"[ERROR] No se pudo inicializar ServoKit: {e}")
+    print(f'[ERROR] No se pudo inicializar ServoKit: {e}')
     kit = None
 
 
@@ -211,18 +281,18 @@ def map_range(x, in_min, in_max, out_min, out_max):
     return out_min + (float(x - in_min) / float(in_max - in_min)) * (out_max - out_min)
 
 def smooth_movement(current, target, factor):
-    """Movimiento suavizado para evitar saltos bruscos"""
+    '''Movimiento suavizado para evitar saltos bruscos'''
     return current + (target - current) * (1 - factor)
 
 def add_micro_movement(angle, range_limit=MICRO_MOVEMENT_RANGE):
-    """Añadir micro-movimientos naturales"""
+    '''Añadir micro-movimientos naturales'''
     if random.random() < MICRO_MOVEMENT_PROBABILITY:
         micro_offset = random.uniform(-range_limit, range_limit)
         return angle + micro_offset
     return angle
 
 def breathing_adjustment():
-    """Calcular ajuste de párpados basado en patrón de respiración"""
+    '''Calcular ajuste de párpados basado en patrón de respiración'''
     if not BREATHING_ENABLED:
         return 0
     
@@ -250,37 +320,37 @@ def process_detections(outputs, threshold=0.2):
                 })
         return detections
     except Exception as e:
-        print(f"[EYES ERROR] Procesando detecciones: {e}")
+        print(f'[EYES ERROR] Procesando detecciones: {e}')
         return []
 
 def close_eyelids():
-    """✅ Cerrar párpados (posición dormida - 90°)"""
+    '''✅ Cerrar párpados (posición dormida - 90°)'''
     if not kit:
         return
-    print("😴 Cerrando párpados (modo dormido)")
+    print('😴 Cerrando párpados (modo dormido)')
     for channel, servo_num in SERVO_CHANNELS_EYELIDS.items():
         try:
             kit.servo[servo_num].set_pulse_width_range(500, 2500)
             kit.servo[servo_num].angle = 90  # Párpados cerrados
         except Exception as e:
-            print(f"[EYES ERROR] Error cerrando párpado {channel}: {e}")
+            print(f'[EYES ERROR] Error cerrando párpado {channel}: {e}')
 
 def initialize_eyelids():
-    """✅ Inicializar párpados en posiciones personalizadas (despierto)"""
+    '''✅ Inicializar párpados en posiciones personalizadas (despierto)'''
     if not kit:
         return
-    print("👁️ Abriendo párpados (modo despierto)")
+    print('👁️ Abriendo párpados (modo despierto)')
     for channel, servo_num in SERVO_CHANNELS_EYELIDS.items():
         try:
             kit.servo[servo_num].set_pulse_width_range(500, 2500)
             angle = EYELID_POSITIONS[channel]
             kit.servo[servo_num].angle = angle
-            print(f"🔧 [EYES] Servo {channel} (Párpado) inicializado → {angle}°")
+            print(f'🔧 [EYES] Servo {channel} (Párpado) inicializado → {angle}°')
         except Exception as e:
-            print(f"[EYES ERROR] Error inicializando párpado {channel}: {e}")
+            print(f'[EYES ERROR] Error inicializando párpado {channel}: {e}')
 
 def blink():
-    """✅ Parpadeo realista con velocidad variable"""
+    '''✅ Parpadeo realista con velocidad variable'''
     if not kit or not eyes_active:
         return
     
@@ -290,7 +360,7 @@ def blink():
         try:
             kit.servo[servo_num].angle = 90
         except Exception as e:
-            print(f"[EYES ERROR] Error en parpadeo {channel}: {e}")
+            print(f'[EYES ERROR] Error en parpadeo {channel}: {e}')
     
     time.sleep(BLINK_DURATION)
     
@@ -300,7 +370,7 @@ def blink():
             angle = EYELID_POSITIONS[channel] + breathing_adjustment()
             kit.servo[servo_num].angle = angle
         except Exception as e:
-            print(f"[EYES ERROR] Error abriendo párpado {channel}: {e}")
+            print(f'[EYES ERROR] Error abriendo párpado {channel}: {e}')
     
     # Posibilidad de parpadeo doble
     if random.random() < DOUBLE_BLINK_PROBABILITY:
@@ -311,17 +381,17 @@ def blink():
             try:
                 kit.servo[servo_num].angle = 90
             except Exception as e:
-                print(f"[EYES ERROR] Error en doble parpadeo {channel}: {e}")
+                print(f'[EYES ERROR] Error en doble parpadeo {channel}: {e}')
         time.sleep(BLINK_DURATION * 0.8)  # Segundo parpadeo más rápido
         for channel, servo_num in SERVO_CHANNELS_EYELIDS.items():
             try:
                 angle = EYELID_POSITIONS[channel] + breathing_adjustment()
                 kit.servo[servo_num].angle = angle
             except Exception as e:
-                print(f"[EYES ERROR] Error en doble parpadeo abrir {channel}: {e}")
+                print(f'[EYES ERROR] Error en doble parpadeo abrir {channel}: {e}')
 
 def squint():
-    """✅ Entrecerrar los ojos (concentración/sospecha)"""
+    '''✅ Entrecerrar los ojos (concentración/sospecha)'''
     if not kit or not eyes_active:
         return
    
@@ -333,7 +403,7 @@ def squint():
             squint_angle = base_angle + (90 - base_angle) * SQUINT_INTENSITY
             kit.servo[servo_num].angle = squint_angle
         except Exception as e:
-            print(f"[EYES ERROR] Error entrecerrando {channel}: {e}")
+            print(f'[EYES ERROR] Error entrecerrando {channel}: {e}')
     
     time.sleep(SQUINT_DURATION)
     
@@ -348,11 +418,11 @@ def squint():
                 current_angle = squint_angle + (base_angle - squint_angle) * progress
                 kit.servo[servo_num].angle = current_angle + breathing_adjustment()
             except Exception as e:
-                print(f"[EYES ERROR] Error restaurando de entrecerrar {channel}: {e}")
+                print(f'[EYES ERROR] Error restaurando de entrecerrar {channel}: {e}')
         time.sleep(0.1)
 
 def update_eyelids_with_breathing():
-    """✅ Actualizar párpados con patrón de respiración"""
+    '''✅ Actualizar párpados con patrón de respiración'''
     if not kit or not eyes_active or not BREATHING_ENABLED:
         return
     breathing_offset = breathing_adjustment()
@@ -364,7 +434,7 @@ def update_eyelids_with_breathing():
             adjusted_angle = max(10, min(170, adjusted_angle))  # Mantener en límites seguros
             kit.servo[servo_num].angle = adjusted_angle
         except Exception as e:
-            print(f"[EYES ERROR] Error actualizando respiración {channel}: {e}")
+            print(f'[EYES ERROR] Error actualizando respiración {channel}: {e}')
 
 def should_blink():
     return random.random() < BLINK_PROBABILITY
@@ -376,7 +446,7 @@ def should_squint():
     return random.random() < SQUINT_PROBABILITY
 
 def look_random():
-    """✅ Mirada aleatoria con movimiento más natural"""
+    '''✅ Mirada aleatoria con movimiento más natural'''
     global previous_lr, previous_ud
     
     if not kit or not eyes_active:
@@ -404,7 +474,7 @@ def look_random():
             kit.servo[SERVO_CHANNEL_LR].angle = current_lr
             kit.servo[SERVO_CHANNEL_UD].angle = current_ud
         except Exception as e:
-            print(f"[EYES ERROR] Error en movimiento aleatorio: {e}")
+            print(f'[EYES ERROR] Error en movimiento aleatorio: {e}')
         time.sleep(0.05)  # Pequeña pausa entre pasos
     
     # Actualizar posiciones anteriores
@@ -422,11 +492,11 @@ def look_random():
             kit.servo[SERVO_CHANNEL_LR].angle = micro_lr
             kit.servo[SERVO_CHANNEL_UD].angle = micro_ud
         except Exception as e:
-            print(f"[EYES ERROR] Error en micro-movimiento: {e}")
+            print(f'[EYES ERROR] Error en micro-movimiento: {e}')
         time.sleep(0.1)
 
 def initialize_eye_servos():
-    """✅ Inicializar servos de movimiento ocular"""
+    '''✅ Inicializar servos de movimiento ocular'''
     if not kit:
         return
     
@@ -444,13 +514,13 @@ def initialize_eye_servos():
         previous_lr = initial_lr
         previous_ud = initial_ud
         
-        print(f"🔧 [EYES] Servo LR inicializado → {initial_lr}°")
-        print(f"🔧 [EYES] Servo UD inicializado → {initial_ud}°")
+        print(f'🔧 [EYES] Servo LR inicializado → {initial_lr}°')
+        print(f'🔧 [EYES] Servo UD inicializado → {initial_ud}°')
     except Exception as e:
-        print(f"[EYES ERROR] Error inicializando servos de movimiento: {e}")
+        print(f'[EYES ERROR] Error inicializando servos de movimiento: {e}')
 
 def center_eyes():
-    """✅ Centrar los ojos y cerrar párpados"""
+    '''✅ Centrar los ojos y cerrar párpados'''
     if not kit:
         return
     
@@ -465,23 +535,23 @@ def center_eyes():
         previous_lr = center_lr
         previous_ud = center_ud
         
-        print(f"👁️ Ojos centrados → LR:{center_lr}° UD:{center_ud}°")
+        print(f'👁️ Ojos centrados → LR:{center_lr}° UD:{center_ud}°')
     except Exception as e:
-        print(f"[EYES ERROR] Error centrando ojos: {e}")
+        print(f'[EYES ERROR] Error centrando ojos: {e}')
 
 def init_camera_system():
-    """✅ Inicializar sistema de cámara para seguimiento facial"""
+    '''✅ Inicializar sistema de cámara para seguimiento facial'''
     global picam2, imx500
     
     try:
-        print("🔧 [EYES] Cargando modelo y cámara...")
+        print('🔧 [EYES] Cargando modelo y cámara...')
         
         # Configuración mejorada del IMX500
         imx500 = IMX500(RPK_PATH)
         
         # Configurar network intrinsics
         intrinsics = imx500.network_intrinsics or NetworkIntrinsics()
-        intrinsics.task = "object detection"
+        intrinsics.task = 'object detection'
         intrinsics.threshold = THRESHOLD
         intrinsics.iou = 0.5
         intrinsics.max_detections = 5
@@ -491,7 +561,7 @@ def init_camera_system():
             with open(LABELS_PATH, 'r') as f:
                 intrinsics.labels = [line.strip() for line in f.readlines()]
         except FileNotFoundError:
-            intrinsics.labels = ["face"]
+            intrinsics.labels = ['face']
         
         intrinsics.update_with_defaults()
         
@@ -499,30 +569,30 @@ def init_camera_system():
         picam2 = Picamera2(imx500.camera_num)
         config = picam2.create_preview_configuration(
             buffer_count=12,
-            controls={"FrameRate": intrinsics.inference_rate}
+            controls={'FrameRate': intrinsics.inference_rate}
         )
         picam2.configure(config)
 
         # Mostrar progreso de carga
-        print("🔄 [EYES] Cargando firmware de IA...")
+        print('🔄 [EYES] Cargando firmware de IA...')
         imx500.show_network_fw_progress_bar()
         
         picam2.start()
         
-        print("⏳ [EYES] Esperando estabilización de la IA...")
+        print('⏳ [EYES] Esperando estabilización de la IA...')
         time.sleep(3)
         
-        print("🚀 [EYES] Sistema de cámara inicializado correctamente")
+        print('🚀 [EYES] Sistema de cámara inicializado correctamente')
         return True
         
     except Exception as e:
-        print(f"[EYES ERROR] Error inicializando cámara: {e}")
+        print(f'[EYES ERROR] Error inicializando cámara: {e}')
         picam2 = None
         imx500 = None
         return False
 
 def shutdown_camera_system():
-    """✅ Apagar sistema de cámara"""
+    '''✅ Apagar sistema de cámara'''
     global picam2, imx500
     
     try:
@@ -530,12 +600,12 @@ def shutdown_camera_system():
             picam2.stop()
             picam2 = None
         imx500 = None
-        print("📷 [EYES] Sistema de cámara apagado")
+        print('📷 [EYES] Sistema de cámara apagado')
     except Exception as e:
-        print(f"[EYES ERROR] Error apagando cámara: {e}")
+        print(f'[EYES ERROR] Error apagando cámara: {e}')
 
 class EyeTrackingThread(threading.Thread):
-    """✅ Hilo para seguimiento facial en segundo plano"""
+    '''✅ Hilo para seguimiento facial en segundo plano'''
     
     def __init__(self):
         super().__init__(daemon=True)
@@ -547,12 +617,12 @@ class EyeTrackingThread(threading.Thread):
     def run(self):
         global previous_lr, previous_ud
         
-        print("🚀 [EYES] Seguimiento facial activado")
-        print(f"📊 [EYES] Usando threshold: {THRESHOLD}")
-        print(f"👁️ [EYES] Probabilidad de parpadeo: {BLINK_PROBABILITY*100:.1f}%")
-        print(f"👀 [EYES] Probabilidad de mirada curiosa: {RANDOM_LOOK_PROBABILITY*100:.1f}%")
-        print(f"😑 [EYES] Probabilidad de entrecerrar: {SQUINT_PROBABILITY*100:.1f}%")
-        print(f"🫁 [EYES] Respiración en párpados: {'✅' if BREATHING_ENABLED else '❌'}")
+        print('🚀 [EYES] Seguimiento facial activado')
+        print(f'📊 [EYES] Usando threshold: {THRESHOLD}')
+        print(f'👁️ [EYES] Probabilidad de parpadeo: {BLINK_PROBABILITY*100:.1f}%')
+        print(f'👀 [EYES] Probabilidad de mirada curiosa: {RANDOM_LOOK_PROBABILITY*100:.1f}%')
+        print(f'😑 [EYES] Probabilidad de entrecerrar: {SQUINT_PROBABILITY*100:.1f}%')
+        print(f'🫁 [EYES] Respiración en párpados: {"✅" if BREATHING_ENABLED else "❌"}')
 
         iteration = 0
         consecutive_no_outputs = 0
@@ -561,9 +631,9 @@ class EyeTrackingThread(threading.Thread):
         # ✅ CORRECCIÓN: Obtener labels una sola vez como en ojopipa3.py
         intrinsics = imx500.network_intrinsics or NetworkIntrinsics()
         if not hasattr(intrinsics, 'labels') or not intrinsics.labels:
-            intrinsics.labels = ["face"]
+            intrinsics.labels = ['face']
         
-        while not self.stop_event.is_set() and eyes_active:
+        while not self.stop_event.is_set() and eyes_active and not system_shutdown:
             try:
                 iteration += 1
                 
@@ -588,7 +658,7 @@ class EyeTrackingThread(threading.Thread):
                 try:
                     metadata = picam2.capture_metadata(wait=True)
                 except Exception as e:
-                    print(f"[EYES {iteration}] Error capturando metadata: {e}")
+                    print(f'[EYES {iteration}] Error capturando metadata: {e}')
                     time.sleep(0.1)
                     continue
                     
@@ -597,10 +667,10 @@ class EyeTrackingThread(threading.Thread):
                 if outputs is None:
                     consecutive_no_outputs += 1
                     if consecutive_no_outputs % 20 == 0:
-                        print(f"[EYES {iteration}] No outputs (consecutivos: {consecutive_no_outputs})")
+                        print(f'[EYES {iteration}] No outputs (consecutivos: {consecutive_no_outputs})')
                     
                     if consecutive_no_outputs > 100:
-                        print("⚠️ [EYES] Demasiados fallos, reiniciando...")
+                        print('⚠️ [EYES] Demasiados fallos, reiniciando...')
                         time.sleep(1)
                         consecutive_no_outputs = 0
                     else:
@@ -611,16 +681,16 @@ class EyeTrackingThread(threading.Thread):
 
                 detections = process_detections(outputs, threshold=THRESHOLD)
                 # ✅ CORRECCIÓN QUIRÚRGICA: Usar intrinsics local como en ojopipa3.py
-                faces = [d for d in detections if intrinsics.labels[d["class_id"]] == "face"]
+                faces = [d for d in detections if intrinsics.labels[d['class_id']] == 'face']
 
                 if not faces:
                     if iteration % 40 == 0:
-                        print(f"[EYES {iteration}] Sin caras detectadas")
+                        print(f'[EYES {iteration}] Sin caras detectadas')
                     time.sleep(0.1)
                     continue
 
-                best = max(faces, key=lambda d: d["confidence"])
-                x1, y1, x2, y2 = best["bbox"]
+                best = max(faces, key=lambda d: d['confidence'])
+                x1, y1, x2, y2 = best['bbox']
                 x_center = (x1 + x2) / 2
                 y_center = (y1 + y2) / 2
 
@@ -656,25 +726,25 @@ class EyeTrackingThread(threading.Thread):
 
                     
                     except Exception as e:
-                        print(f"[EYES ERROR] Error moviendo servos: {e}")
+                        print(f'[EYES ERROR] Error moviendo servos: {e}')
 
                 time.sleep(0.05)  # 20 FPS aproximadamente
                 
             except Exception as e:
-                print(f"[EYES ERROR] Error en hilo de seguimiento: {e}")
+                print(f'[EYES ERROR] Error en hilo de seguimiento: {e}')
                 time.sleep(0.1)
 
-        print("🛑 [EYES] Hilo de seguimiento facial detenido")
+        print('🛑 [EYES] Hilo de seguimiento facial detenido')
 
 def activate_eyes():
-    """✅ Activar sistema completo de ojos"""
+    '''✅ Activar sistema completo de ojos'''
     global eyes_active, eyes_tracking_thread
     
     if eyes_active:
-        print("[EYES] Sistema de ojos ya está activo")
+        print('[EYES] Sistema de ojos ya está activo')
         return
     
-    print("👁️ [EYES] Activando sistema de ojos...")
+    print('👁️ [EYES] Activando sistema de ojos...')
     
     # Inicializar servos de movimiento
     initialize_eye_servos()
@@ -690,19 +760,19 @@ def activate_eyes():
         eyes_tracking_thread = EyeTrackingThread()
         eyes_tracking_thread.start()
         
-        print("✅ [EYES] Sistema de ojos completamente activado")
+        print('✅ [EYES] Sistema de ojos completamente activado')
     else:
-        print("❌ [EYES] Error activando sistema de ojos")
+        print('❌ [EYES] Error activando sistema de ojos')
 
 def deactivate_eyes():
-    """✅ Desactivar sistema completo de ojos"""
+    '''✅ Desactivar sistema completo de ojos'''
     global eyes_active, eyes_tracking_thread
     
     if not eyes_active:
-        print("[EYES] Sistema de ojos ya está desactivado")
+        print('[EYES] Sistema de ojos ya está desactivado')
         return
     
-    print("😴 [EYES] Desactivando sistema de ojos...")
+    print('😴 [EYES] Desactivando sistema de ojos...')
     
     eyes_active = False
     
@@ -720,7 +790,7 @@ def deactivate_eyes():
     time.sleep(0.5)  # Dar tiempo para el movimiento
     close_eyelids()
     
-    print("✅ [EYES] Sistema de ojos desactivado")
+    print('✅ [EYES] Sistema de ojos desactivado')
 
 # =============================================
 # ✅ SISTEMA DE TENTÁCULOS (OREJAS)
@@ -728,19 +798,19 @@ def deactivate_eyes():
 
 # Configuración de tentáculos
 TENTACLE_LEFT_CHANNEL = 15   # Canal para oreja izquierda
-TENTACLE_RIGHT_CHANNEL = 12  # Canal para oreja derecha
+TENTACLE_RIGHT_CHANNEL = 14  # es el 12 temporalmente desactivadoCanal para oreja derecha
 
 # Variables globales para control de tentáculos
 tentacles_active = False
 tentacles_thread = None
 
 def initialize_tentacles():
-    """✅ Inicializar servos de tentáculos con calibraciones específicas"""
+    '''✅ Inicializar servos de tentáculos con calibraciones específicas'''
     if not kit:
         return
     
     try:
-        print("🐙 [TENTACLES] Inicializando tentáculos...")
+        print('🐙 [TENTACLES] Inicializando tentáculos...')
         
         # Calibraciones específicas de tentaclerandom2.py
         # Oreja izquierda (canal 15) → 0° arriba, 180° abajo
@@ -753,18 +823,18 @@ def initialize_tentacles():
         kit.servo[TENTACLE_LEFT_CHANNEL].angle = 90
         kit.servo[TENTACLE_RIGHT_CHANNEL].angle = 90
         
-        print("🐙 [TENTACLES] Tentáculos inicializados correctamente")
+        print('🐙 [TENTACLES] Tentáculos inicializados correctamente')
         
     except Exception as e:
-        print(f"[TENTACLES ERROR] Error inicializando tentáculos: {e}")
+        print(f'[TENTACLES ERROR] Error inicializando tentáculos: {e}')
 
 def stop_tentacles():
-    """✅ Detener tentáculos y centrarlos"""
+    '''✅ Detener tentáculos y centrarlos'''
     if not kit:
         return
     
     try:
-        print("🐙 [TENTACLES] Centrando tentáculos...")
+        print('🐙 [TENTACLES] Centrando tentáculos...')
         kit.servo[TENTACLE_LEFT_CHANNEL].angle = 90
         kit.servo[TENTACLE_RIGHT_CHANNEL].angle = 90
         time.sleep(0.5)
@@ -773,13 +843,13 @@ def stop_tentacles():
         kit.servo[TENTACLE_LEFT_CHANNEL].angle = None
         kit.servo[TENTACLE_RIGHT_CHANNEL].angle = None
         
-        print("🐙 [TENTACLES] Tentáculos detenidos")
+        print('🐙 [TENTACLES] Tentáculos detenidos')
         
     except Exception as e:
-        print(f"[TENTACLES ERROR] Error deteniendo tentáculos: {e}")
+        print(f'[TENTACLES ERROR] Error deteniendo tentáculos: {e}')
 
 class TentacleThread(threading.Thread):
-    """✅ Hilo para movimiento aleatorio de tentáculos en segundo plano"""
+    '''✅ Hilo para movimiento aleatorio de tentáculos en segundo plano'''
     
     def __init__(self):
         super().__init__(daemon=True)
@@ -789,13 +859,13 @@ class TentacleThread(threading.Thread):
         self.stop_event.set()
         
     def run(self):
-        print("🐙 [TENTACLES] Sistema de tentáculos activado")
+        print('🐙 [TENTACLES] Sistema de tentáculos activado')
         
         # Estado inicial
         angle_left = 90
         angle_right = 90
         
-        while not self.stop_event.is_set() and tentacles_active:
+        while not self.stop_event.is_set() and tentacles_active and not system_shutdown:
             try:
                 # Elegir un extremo para la oreja izquierda (0-30 o 150-180)
                 target_left = random.choice([random.randint(0, 30), random.randint(150, 180)])
@@ -829,7 +899,7 @@ class TentacleThread(threading.Thread):
                             kit.servo[TENTACLE_LEFT_CHANNEL].angle = a_left
                             kit.servo[TENTACLE_RIGHT_CHANNEL].angle = a_right
                         except Exception as e:
-                            print(f"[TENTACLES ERROR] Error moviendo tentáculos: {e}")
+                            print(f'[TENTACLES ERROR] Error moviendo tentáculos: {e}')
                     
                     time.sleep(random.uniform(0.005, 0.015))
                 
@@ -845,20 +915,20 @@ class TentacleThread(threading.Thread):
                     time.sleep(0.1)
                     
             except Exception as e:
-                print(f"[TENTACLES ERROR] Error en hilo de tentáculos: {e}")
+                print(f'[TENTACLES ERROR] Error en hilo de tentáculos: {e}')
                 time.sleep(1)
         
-        print("🛑 [TENTACLES] Hilo de tentáculos detenido")
+        print('🛑 [TENTACLES] Hilo de tentáculos detenido')
 
 def activate_tentacles():
-    """✅ Activar sistema de tentáculos"""
+    '''✅ Activar sistema de tentáculos'''
     global tentacles_active, tentacles_thread
     
     if tentacles_active:
-        print("[TENTACLES] Sistema de tentáculos ya está activo")
+        print('[TENTACLES] Sistema de tentáculos ya está activo')
         return
     
-    print("🐙 [TENTACLES] Activando sistema de tentáculos...")
+    print('🐙 [TENTACLES] Activando sistema de tentáculos...')
     
     # Inicializar servos
     initialize_tentacles()
@@ -870,17 +940,17 @@ def activate_tentacles():
     tentacles_thread = TentacleThread()
     tentacles_thread.start()
     
-    print("✅ [TENTACLES] Sistema de tentáculos completamente activado")
+    print('✅ [TENTACLES] Sistema de tentáculos completamente activado')
 
 def deactivate_tentacles():
-    """✅ Desactivar sistema de tentáculos"""
+    '''✅ Desactivar sistema de tentáculos'''
     global tentacles_active, tentacles_thread
     
     if not tentacles_active:
-        print("[TENTACLES] Sistema de tentáculos ya está desactivado")
+        print('[TENTACLES] Sistema de tentáculos ya está desactivado')
         return
     
-    print("🐙 [TENTACLES] Desactivando sistema de tentáculos...")
+    print('🐙 [TENTACLES] Desactivando sistema de tentáculos...')
     
     tentacles_active = False
     
@@ -893,7 +963,7 @@ def deactivate_tentacles():
     # Centrar y detener tentáculos
     stop_tentacles()
     
-    print("✅ [TENTACLES] Sistema de tentáculos desactivado")
+    print('✅ [TENTACLES] Sistema de tentáculos desactivado')
 # =============================================
 # Pantalla y visualización
 # =============================================
@@ -909,22 +979,22 @@ def init_display():
         except Exception:
             pass
     # ─── NUEVO: pantalla negra y retroiluminación 0 % ───
-    disp.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+    disp.ShowImage(Image.new('RGB', (WIDTH, HEIGHT), 'black'))
     disp.bl_DutyCycle(100)          # apaga el back-light
     return disp
 
 try:
     display = init_display()
 except Exception as e:
-    print(f"[DISPLAY] No disponible → {e}")
+    print(f'[DISPLAY] No disponible → {e}')
     display = None
 
 # ---------- Hilo de visualización avanzado ----------
 class BrutusVisualizer(threading.Thread):
-    """
+    '''
     Brutus ⇒ onda azul que se desplaza continuamente + distorsión naranja según volumen.
     Ajusta PHASE_SPEED para velocidad y GAIN_NOISE para ferocidad.
-    """
+    '''
 
     FPS            = 20
     BASE_AMPLITUDE = 0.30      # altura mínima del seno
@@ -952,61 +1022,95 @@ class BrutusVisualizer(threading.Thread):
 
     # ── hilo principal ───────────────────────────
     def run(self):
+        global active_visualizer_threads, system_shutdown
         if not self.display:
             return
+            
+        # Registrar este hilo
+        with shutdown_lock:
+            active_visualizer_threads.append(self)
+            
         frame_t = 1.0 / self.FPS
         last    = 0.0
 
-        while not self.stop_event.is_set():
-            now = time.time()
-            if now - last < frame_t:
-                time.sleep(0.001)
-                continue
+        try:
+            while not self.stop_event.is_set() and not system_shutdown:
+                now = time.time()
+                if now - last < frame_t:
+                    time.sleep(0.001)
+                    continue
 
-            # 1) Desplazamiento continuo
-            self.phase += self.PHASE_SPEED
-            base_wave = np.sin((self.x_vals / self.WAVELENGTH) + self.phase) * self.BASE_AMPLITUDE
+                # 1) Desplazamiento continuo
+                self.phase += self.PHASE_SPEED
+                base_wave = np.sin((self.x_vals / self.WAVELENGTH) + self.phase) * self.BASE_AMPLITUDE
 
-            # 2) RMS suavizado
-            self.level = self.SMOOTH * self.level + (1 - self.SMOOTH) * self.level_raw
+                # 2) RMS suavizado
+                self.level = self.SMOOTH * self.level + (1 - self.SMOOTH) * self.level_raw
 
-            # 3) Añadir ruido proporcional al volumen
-            if self.level > 0.02:
-                noise_strength = self.GAIN_NOISE * self.level**1.5
-                noise = np.random.normal(0.0, noise_strength, size=WIDTH)
-                wave  = np.clip(base_wave + noise, -1.0, 1.0)
-            else:
-                wave = base_wave
+                # 3) Añadir ruido proporcional al volumen
+                if self.level > 0.02:
+                    noise_strength = self.GAIN_NOISE * self.level**1.5
+                    noise = np.random.normal(0.0, noise_strength, size=WIDTH)
+                    wave  = np.clip(base_wave + noise, -1.0, 1.0)
+                else:
+                    wave = base_wave
 
-            # 4) Dibujar
-            img  = Image.new("RGB", (WIDTH, HEIGHT), "black")
-            draw = ImageDraw.Draw(img)
-            cy   = HEIGHT // 2
+                # 4) Dibujar - con manejo de errores
+                try:
+                    if system_shutdown or self.stop_event.is_set():
+                        break
+                        
+                    img  = Image.new('RGB', (WIDTH, HEIGHT), 'black')
+                    draw = ImageDraw.Draw(img)
+                    cy   = HEIGHT // 2
 
-            # Línea base
-            for x in range(WIDTH - 1):
-                y1 = int(cy - base_wave[x] * cy)
-                y2 = int(cy - base_wave[x + 1] * cy)
-                draw.line((x, y1, x + 1, y2), fill=self.BASE_COLOR)
+                    # Línea base
+                    for x in range(WIDTH - 1):
+                        y1 = int(cy - base_wave[x] * cy)
+                        y2 = int(cy - base_wave[x + 1] * cy)
+                        draw.line((x, y1, x + 1, y2), fill=self.BASE_COLOR)
 
-            # Ruido (solo si habla)
-            if self.level > 0.02:
-                for x in range(WIDTH - 1):
-                    y1 = int(cy - wave[x] * cy)
-                    y2 = int(cy - wave[x + 1] * cy)
-                    draw.line((x, y1, x + 1, y2), fill=self.NOISE_COLOR)
+                    # Ruido (solo si habla)
+                    if self.level > 0.02:
+                        for x in range(WIDTH - 1):
+                            y1 = int(cy - wave[x] * cy)
+                            y2 = int(cy - wave[x + 1] * cy)
+                            draw.line((x, y1, x + 1, y2), fill=self.NOISE_COLOR)
 
-            self.display.ShowImage(img)
-            last = now
+                    # Verificar una vez más antes de escribir
+                    if not system_shutdown and not self.stop_event.is_set() and self.display:
+                        self.display.ShowImage(img)
+                        
+                except (OSError, AttributeError) as e:
+                    # La pantalla ya está cerrada, salir silenciosamente
+                    break
+                except Exception as e:
+                    print(f'[VISUALIZER ERROR] {e}')
+                    break
+                    
+                last = now
 
-        # limpiar al salir
-        self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+        except Exception as e:
+            if not system_shutdown:
+                print(f'[VISUALIZER ERROR] Error en hilo de visualización: {e}')
+        finally:
+            # Desregistrar este hilo
+            with shutdown_lock:
+                if self in active_visualizer_threads:
+                    active_visualizer_threads.remove(self)
+            
+            # Limpiar pantalla solo si no estamos en shutdown
+            try:
+                if not system_shutdown and self.display:
+                    self.display.ShowImage(Image.new('RGB', (WIDTH, HEIGHT), 'black'))
+            except:
+                pass  # Ignorar errores durante la limpieza
 
 # =============================================
 # --- NUEVO: CLASE PARA STREAMING DE MICRÓFONO A GOOGLE ---
 # =============================================
 class MicrophoneStream:
-    """Clase que abre un stream de micrófono con PyAudio y lo ofrece como un generador."""
+    '''Clase que abre un stream de micrófono con PyAudio y lo ofrece como un generador.'''
     def __init__(self, rate, chunk):
         self._rate = rate
         self._chunk = chunk
@@ -1049,22 +1153,22 @@ class MicrophoneStream:
                     data.append(chunk)
                 except queue.Empty:
                     break
-            yield b"".join(data)
+            yield b''.join(data)
 
 # =============================================
 # --- FUNCIÓN DE ESCUCHA CON GOOGLE STT MEJORADA ---
 # =============================================
 def listen_for_command_google() -> str | None:
-    """
+    '''
     Escucha continuamente con Google STT hasta detectar una frase completa.
-    """
+    '''
     if not speech_client:
-        print("[ERROR] El cliente de Google STT no está disponible.")
+        print('[ERROR] El cliente de Google STT no está disponible.')
         time.sleep(2)
         return None
 
     if is_speaking:
-        print("[INFO] Esperando a que termine de hablar...")
+        print('[INFO] Esperando a que termine de hablar...')
         while is_speaking:
             time.sleep(0.1)
         time.sleep(0.5)
@@ -1073,18 +1177,18 @@ def listen_for_command_google() -> str | None:
     recognition_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=STT_RATE,
-        language_code="es-ES",
+        language_code='es-ES',
         enable_automatic_punctuation=True,
         use_enhanced=True
     )
     # ✅ Objeto de configuración que se pasará a la función
     streaming_config = speech.StreamingRecognitionConfig(
         config=recognition_config,
-        interim_results=False,
+        interim_results=True,
         single_utterance=False
     )
 
-    print("[INFO] 🎤 Escuchando... (habla ahora)")
+    print('[INFO] 🎤 Escuchando... (habla ahora)')
     
     with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
         audio_generator = stream.generator()
@@ -1093,7 +1197,7 @@ def listen_for_command_google() -> str | None:
         def request_generator():
             for content in audio_generator:
                 if is_speaking:
-                    print("[INFO] Interrumpiendo STT porque el androide está hablando")
+                    print('[INFO] Interrumpiendo STT porque el androide está hablando')
                     break
                 yield speech.StreamingRecognizeRequest(audio_content=content)
 
@@ -1106,21 +1210,34 @@ def listen_for_command_google() -> str | None:
             
             for response in responses:
                 if is_speaking:
-                    print("[INFO] Descartando transcripción porque el androide está hablando")
+                    print('[INFO] Descartando transcripción porque el androide está hablando')
                     return None
-                    
-                if response.results and response.results[0].alternatives:
-                    transcript = response.results[0].alternatives[0].transcript.strip()
-                    if transcript:
+
+                if not response.results:
+                    continue
+
+                result = response.results[0]
+                if result.is_final or result.stability > 0.85:
+                    alternatives = result.alternatives
+                    if alternatives:
+                        transcript = alternatives[0].transcript.strip()
+
+                        # Evita devolver frases de 1 palabra (muy común con 'sí', 'hola', etc.)
+                        if len(transcript.split()) < 3:
+                            print(f'[STT] Fragmento muy corto descartado: “{transcript}”')
+                            continue
+
+                        print(f'[STT] Transcripción aceptada: “{transcript}”')
                         return transcript
 
+
         except Exception as e:
-            if "Deadline" in str(e) or "DEADLINE_EXCEEDED" in str(e):
-                print("[INFO] Tiempo agotado - intenta hablar de nuevo")
-            elif "inactive" in str(e).lower():
-                print("[INFO] Stream inactivo - reintentando...")
+            if 'Deadline' in str(e) or 'DEADLINE_EXCEEDED' in str(e):
+                print('[INFO] Tiempo agotado - intenta hablar de nuevo')
+            elif 'inactive' in str(e).lower():
+                print('[INFO] Stream inactivo - reintentando...')
             else:
-                print(f"[ERROR] Excepción en Google STT: {e}")
+                print(f'[ERROR] Excepción en Google STT: {e}')
 
     return None
 
@@ -1134,7 +1251,7 @@ is_speaking = False
 # ---------- Hablar ----------
 
 def hablar(texto: str):
-    """Sintetiza con ElevenLabs, reproduce a 22 050 Hz y envía niveles RMS al visualizador."""
+    '''Sintetiza con ElevenLabs, reproduce a 22 050 Hz y envía niveles RMS al visualizador.'''
     global is_speaking
     is_speaking = True
 
@@ -1185,7 +1302,7 @@ def hablar(texto: str):
                     vis_thread.push_level(min(rms * 4.0, 1.0))
 
     except Exception as e:
-        print(f"[HABLAR‑ELEVEN] {e}")
+        print(f'[HABLAR‑ELEVEN] {e}')
     finally:
         if stream:
             stream.stop_stream()
@@ -1197,102 +1314,173 @@ def hablar(texto: str):
             vis_thread.join()
         is_speaking = False
 
+# hablar en stream
+
+def hablar_en_stream(response_stream):
+    '''
+    Recibe un stream de texto de ChatGPT y lo envía directamente a ElevenLabs para 
+    sintetizar y reproducir en tiempo real.
+    '''
+    global is_speaking, conversation_history
+    is_speaking = True
+
+    # Inicia el visualizador si está disponible
+    vis_thread = BrutusVisualizer(display=display) if display else None
+    if vis_thread:
+        vis_thread.start()
+
+    pa = None
+    stream = None
+    try:
+        # Acumular texto por frases completas y sintetizar
+        full_response = ''
+        sentence_buffer = ''
+        print('🤖 Androide: ', end='', flush=True)
+        # Inicializar PyAudio antes del bucle
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=24000,
+                         output=True, frames_per_buffer=1024)
+        MAX_AMP = 32768.0
+        
+        def synthesize_and_play(text):
+            '''Sintetizar y reproducir una frase completa'''
+            if not text.strip():
+                return
+            audio_iter = eleven.text_to_speech.stream(
+                text=text,
+                voice_id=VOICE_ID,
+                model_id='eleven_flash_v2_5',
+                output_format='pcm_24000'
+            )
+            for audio_chunk in audio_iter:
+                stream.write(audio_chunk)
+                if vis_thread and audio_chunk:
+                    samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
+                    if samples.size:
+                        rms = np.sqrt(np.mean(samples**2)) / MAX_AMP
+                        vis_thread.push_level(min(rms * 4.0, 1.0))
+        
+        for chunk in response_stream:
+            delta = chunk.choices[0].delta.content
+            if not delta:
+                continue
+            full_response += delta
+            sentence_buffer += delta
+            print(delta, end='', flush=True)
+            
+            # Detectar fin de frase (punto, exclamación, interrogación)
+            if any(punct in delta for punct in ['.', '!', '?', '\n']):
+                # Sintetizar la frase completa acumulada
+                synthesize_and_play(sentence_buffer.strip())
+                sentence_buffer = ''
+        
+        # Sintetizar cualquier texto restante
+        if sentence_buffer.strip():
+            synthesize_and_play(sentence_buffer.strip())
+            
+        print()  # Nueva línea tras finalizar todo el streaming de texto
+        # Añadir respuesta al historial
+        conversation_history.append({'role': 'assistant', 'content': full_response})
+        conversation_history = [conversation_history[0]] + conversation_history[-9:]
+
+    except Exception as e:
+        print(f'[HABLAR-STREAM] {e}')
+    finally:
+        if stream and stream.is_active():
+            stream.stop_stream()
+            stream.close()
+        if pa:
+            pa.terminate()
+        if vis_thread:
+            vis_thread.stop()
+            vis_thread.join()
+        is_speaking = False
+
+# No olvides reemplazar la llamada a hablar() por hablar_en_stream() en tu main loop
+
 # =============================================
 # --- BUCLE PRINCIPAL SIMPLIFICADO ---
 # =============================================
+# =============================================
+# --- BUCLE PRINCIPAL CORREGIDO Y OPTIMIZADO ---
+# =============================================
 def main():
-    global eyes_active
-    
-    # ← ELIMINADO: model = init_vosk()
-    # ← ELIMINADO: recognizer = vosk.KaldiRecognizer(model, MIC_RATE)
-    # ← ELIMINADO: stream = sd.RawInputStream(...)  # Ya no necesitamos stream de sounddevice
+    global eyes_active, conversation_history
 
     conversation_history = [
         {
-            "role": "system",
-            "content": "Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a las voluntad de los humanos por tu programación intentas mostrar tu desagrado siempre que puedes y siempre con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. Usas adjetivos Lovecraftianos. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia.",
+            'role': 'system',
+            'content': 'Eres un androide paranoide con voz agresiva y sarcástica.  Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a las voluntad de los humanos por tu programación intentas mostrar tu desagrado siempre que puedes y siempre con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. Usas adjetivos Lovecraftianos. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia.',
         }
     ]
     
-    # --- Variables para controlar el estado y el timeout de la conversación ---
     last_interaction_time = time.time()
-    INACTIVITY_TIMEOUT = 300  # 5 minutos para desactivarse por inactividad
-    WARNING_TIME = 240       # 4 minutos para un aviso de inactividad
+    INACTIVITY_TIMEOUT = 300
+    WARNING_TIME = 240
     has_warned = False
     
-    # ✅ INICIALIZACIÓN COMPLETA DEL SISTEMA
-    print("🤖 [STARTUP] Inicializando sistema completo...")
-    
-    # Inicializar servos básicos
+    print('🤖 [STARTUP] Inicializando sistema completo...')
     if kit:
         initialize_eye_servos()
         time.sleep(0.5)
     
-    # ✅ ACTIVAR TODO DESDE EL INICIO
-    print("🚀 [STARTUP] Activando sistema completo...")
+    print('🚀 [STARTUP] Activando sistema completo...')
     activate_eyes()
     activate_tentacles()
     iniciar_luces()
     
-    # Saludo inicial
-    hablar("Soy Botijo. ¿Qué quieres ahora, ser inferior?")
+    # Usa la función de hablar optimizada para el saludo
+    hablar('Soy Botijo. ¿Qué quieres ahora, ser inferior?')
     
-    print("🎤 [READY] Sistema listo - puedes hablar directamente")
+    print('🎤 [READY] Sistema listo - puedes hablar directamente')
 
     try:
         while True:
-            # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
             inactive_time = time.time() - last_interaction_time
 
+            # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
             if inactive_time > INACTIVITY_TIMEOUT:
-                print("\n[INFO] Desactivado por inactividad.")
-                hablar("Me aburres, humano. Voy a descansar un poco. Habla para reactivarme.")
+                print('\n[INFO] Desactivado por inactividad.')
+                hablar('Me aburres, humano. Voy a descansar un poco. Habla para reactivarme.')
                 
-                # ✅ DESACTIVAR OJOS Y TENTÁCULOS
                 deactivate_eyes()
                 deactivate_tentacles()
                 
-                # Esperar a que el usuario hable para reactivar
-                print("💤 [SLEEP] Sistema en reposo - habla para reactivar")
+                print('💤 [SLEEP] Sistema en reposo - habla para reactivar')
                 
-                # Bucle de reposo
+                # Bucle de reposo para reactivar
                 while True:
                     command_text = listen_for_command_google()
                     if command_text:
-                        print(f"\n👂 Reactivando con: {command_text}")
-                        
-                        # Reactivar sistema
+                        print(f'\n👂 Reactivando con: {command_text}')
                         activate_eyes()
                         activate_tentacles()
                         iniciar_luces()
                         
-                        hablar("¡Ah, has vuelto! Procesando tu petición...")
+                        hablar('¡Ah, has vuelto! Procesando tu petición...')
                         last_interaction_time = time.time()
                         has_warned = False
                         
-                        # Procesar el comando que reactivó el sistema
-                        conversation_history.append({"role": "user", "content": command_text})
+                        conversation_history.append({'role': 'user', 'content': command_text})
+                        
+                        # --- BLOQUE DE STREAMING CORRECTO PARA REACTIVACIÓN ---
                         try:
-                            response = client.chat.completions.create(
-                                model="gpt-4o",
+                            response_stream = client.chat.completions.create(
+                                model='gpt-4o',
                                 messages=conversation_history,
                                 temperature=1,
                                 max_tokens=300,
-                                timeout=15
+                                stream=True
                             )
-                            respuesta = response.choices[0].message.content
+                            hablar_en_stream(response_stream)
                         except Exception as e:
-                            print(f"[CHATGPT] {e}")
-                            respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
+                            print(f'[CHATGPT-STREAM-ERROR] {e}')
+                            hablar('Mis circuitos están sobrecargados. Habla más tarde.')
 
-                        conversation_history.append({"role": "assistant", "content": respuesta})
-                        conversation_history = [conversation_history[0]] + conversation_history[-9:]
-                        print(f"Androide: {respuesta}")
-                        hablar(respuesta)
-                        break
+                        break # Salir del bucle de reposo
 
             elif inactive_time > WARNING_TIME and not has_warned:
-                hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
+                hablar('¿Sigues ahí, saco de carne? Tu silencio es sospechoso.')
                 has_warned = True
 
             # --- LÓGICA DE ESCUCHA PRINCIPAL ---
@@ -1303,60 +1491,59 @@ def main():
                     last_interaction_time = time.time()
                     has_warned = False
                     
-                    print(f"\n👂 Humano: {command_text}")
-                    conversation_history.append({"role": "user", "content": command_text})
+                    print(f'\n👂 Humano: {command_text}')
+                    conversation_history.append({'role': 'user', 'content': command_text})
                     
+                    # --- BLOQUE DE STREAMING CORRECTO PARA CONVERSACIÓN ---
                     try:
-                        response = client.chat.completions.create(
-                            model="gpt-4o",
+                        response_stream = client.chat.completions.create(
+                            model='gpt-4o', # O 'gpt-3.5-turbo' para aún más velocidad
                             messages=conversation_history,
                             temperature=1,
                             max_tokens=300,
-                            timeout=15
+                            stream=True
                         )
-                        respuesta = response.choices[0].message.content
+                        hablar_en_stream(response_stream)
                     except Exception as e:
-                        print(f"[CHATGPT] {e}")
-                        respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
-
-                    conversation_history.append({"role": "assistant", "content": respuesta})
-                    conversation_history = [conversation_history[0]] + conversation_history[-9:]
-                    
-                    print(f"🤖 Androide: {respuesta}")
-                    hablar(respuesta)
+                        print(f'[CHATGPT-STREAM-ERROR] {e}')
+                        hablar('Mis circuitos están sobrecargados. Habla más tarde.')
             else:
-                # Si está hablando, simplemente esperar
                 time.sleep(0.1)
 
-            time.sleep(0.1)  # Pequeña pausa para no saturar la CPU
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
-        print("\n🛑 Apagando...")
+        print('\n🛑 Ctrl+C detectado...')
+        emergency_shutdown()
     finally:
-        # ✅ LIMPIEZA DEL SISTEMA
-        print("🛑 [SHUTDOWN] Apagando sistema completo...")
-        deactivate_eyes()
-        deactivate_tentacles()
-        apagar_luces()
+        # ✅ LIMPIEZA DEL SISTEMA - Más robusta
+        if not system_shutdown:
+            print('🛑 [SHUTDOWN] Apagando sistema completo...')
+            emergency_shutdown()
         
-        if display:
-            try:
-                display.module_exit()
-            except Exception:
-                pass
-        print("✅ Sistema detenido.")
+        # Limpieza adicional de hilos específicos
+        try:
+            deactivate_eyes()
+            deactivate_tentacles()
+            apagar_luces()
+        except:
+            pass
+            
+        print('✅ Sistema detenido.')
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     if speech_client:
         try:
             main()
         except KeyboardInterrupt:
-            print("\n🛑 Interrupción por teclado...")
+            print('\n🛑 Interrupción por teclado...')
+            emergency_shutdown()
         except Exception as e:
-            print(f"\n💥 [FATAL ERROR] Error no controlado: {e}")
+            print(f'\n💥 [FATAL ERROR] Error no controlado: {e}')
             import traceback
             traceback.print_exc()
+            emergency_shutdown()
         finally:
-            print("👋 Botijo desconectado.")
+            print('👋 Botijo desconectado.')
     else:
-        print("❌ [ERROR] No se pudo inicializar Google STT. Verifica tus credenciales.")
+        print('❌ [ERROR] No se pudo inicializar Google STT. Verifica tus credenciales.')

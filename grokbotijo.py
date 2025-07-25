@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# filepath: /home/jack/botijo/integrator5.py
+# filepath: /home/jack/botijo/grokbotijo.py
 # Script del androide discutidor SIN wake word - Funciona desde el inicio
-# Versión sin Vosk - Solo Google STT + ChatGPT + Piper + Eyes + Tentacles
+# Versión sin Vosk - Solo Google STT + Grok + ElevenLabs + Eyes + Tentacles
 
 import os
 import subprocess
@@ -26,6 +26,9 @@ import math
 import board
 import neopixel
 import threading
+import signal
+import sys
+import atexit
 
 # - Leds Brazo -
 
@@ -55,7 +58,7 @@ def steampunk_danza(delay=0.04):
     t = 0
     glitch_timer = 0
     try:
-        while led_thread_running:
+        while led_thread_running and not system_shutdown:
             for i in range(LED_COUNT):
                 if glitch_timer > 0 and i == random.randint(0, LED_COUNT - 1):
                     pixels[i] = random.choice([(0, 255, 180), (255, 255, 255)])
@@ -110,17 +113,57 @@ from adafruit_servokit import ServoKit
 # Configuración general
 # ========================
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Configuración Grok (reemplaza OpenAI completamente)
+try:
+    xai_api_key = os.getenv("XAI_API_KEY")
+    if not xai_api_key:
+        print("❌ [ERROR] No se encontró la clave XAI_API_KEY en el archivo .env")
+        exit(1)
+    
+    client = OpenAI(
+        api_key=xai_api_key,
+        base_url="https://api.x.ai/v1"
+    )
+    print("✅ [INFO] Cliente Grok inicializado correctamente")
+except Exception as e:
+    print(f"❌ [ERROR] Error inicializando cliente Grok: {e}")
+    exit(1)
+
+# Tools para búsquedas web (Grok las usa nativamente si las defines)
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Busca en internet y devuelve un resumen.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Consulta de búsqueda."}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# Función handler para la tool (simula o integra; Grok maneja internamente, pero esto asegura)
+def handle_web_search(query):
+    print(f"[GROK TOOL] Buscando: {query}")
+    # Si quieres búsqueda custom, integra ddgs aquí; sino, deja que Grok lo haga
+    return f"Resultados para '{query}': [info desde web]."  # Placeholder; expande si necesitas
 
 # Configuración ElevenLabs
 eleven = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-VOICE_ID = 'RnKqZYEeVQciORlpiCz0'
-
+VOICE_ID =   'RnKqZYEeVQciORlpiCz0' # 'ByVRQtaK1WDOvTmP1PKO'  #'RnKqZYEeVQciORlpiCz0' voz buena # voz jacobiana '0IvOsEbrz5BR3wpPyKbU'
+TTS_RATE   = 22_050             # Hz
+CHUNK      = 1024               # frames por trozo de audio
 # --- NUEVO: Configuración Google STT ---
 try:
     speech_client = speech.SpeechClient()
     STT_RATE = 16000
-    STT_CHUNK = int(STT_RATE / 10)  # 100ms de audio por paquete
+    STT_CHUNK = int(STT_RATE * 0.03)   # 100ms de audio por paquete
     print("[INFO] Cliente de Google STT inicializado correctamente.")
 except Exception as e:
     print(f"[ERROR] No se pudo inicializar Google STT. Verifica tus credenciales: {e}")
@@ -183,6 +226,89 @@ eyes_active = False  # Los ojos están activos/desactivos
 eyes_tracking_thread = None
 picam2 = None
 imx500 = None
+
+# ✅ VARIABLES GLOBALES PARA CONTROL DE HILOS Y LIMPIEZA
+system_shutdown = False
+active_visualizer_threads = []
+shutdown_lock = threading.Lock()
+
+def emergency_shutdown():
+    """✅ Función de limpieza de emergencia para Ctrl+C"""
+    global system_shutdown, eyes_active, tentacles_active, led_thread_running
+    global active_visualizer_threads, display
+    
+    with shutdown_lock:
+        if system_shutdown:
+            return  # Ya se está ejecutando
+        system_shutdown = True
+    
+    print("\n🚨 [EMERGENCY] Iniciando limpieza de emergencia...")
+    
+    # 1. Detener todos los visualizadores activos
+    if active_visualizer_threads:
+        print("🛑 [EMERGENCY] Deteniendo visualizadores...")
+        for vis in active_visualizer_threads[:]:  # Copia para evitar modificación concurrente
+            try:
+                vis.stop()
+            except:
+                pass
+        
+        # Esperar un poco para que se detengan
+        time.sleep(0.3)
+    
+    # 2. Detener sistemas principales
+    try:
+        eyes_active = False
+        tentacles_active = False
+        led_thread_running = False
+    except:
+        pass
+    
+    # 3. Devolver ojos y párpados a posición de reposo (90°)
+    try:
+        if kit:
+            print("👁️ [EMERGENCY] Devolviendo ojos y párpados a posición de reposo (90°)...")
+            
+            # Centrar servos de movimiento ocular
+            kit.servo[SERVO_CHANNEL_LR].angle = 90
+            kit.servo[SERVO_CHANNEL_UD].angle = 90
+            
+            # Devolver todos los párpados a 90° (posición de reposo)
+            for channel, servo_num in SERVO_CHANNELS_EYELIDS.items():
+                kit.servo[servo_num].angle = 90
+            
+            print("✅ [EMERGENCY] Ojos y párpados en posición de reposo")
+    except Exception as e:
+        print(f"[EMERGENCY] Error moviendo servos a posición de reposo: {e}")
+    
+    # 4. Limpiar pantalla de forma segura
+    try:
+        if display:
+            display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+            display.module_exit()
+    except:
+        pass
+    
+    # 5. Detener LEDs
+    try:
+        pixels.fill((0, 0, 0))
+        pixels.show()
+    except:
+        pass
+    
+    print("✅ [EMERGENCY] Limpieza completada")
+
+def signal_handler(signum, frame):
+    """✅ Manejador de señales para Ctrl+C"""
+    emergency_shutdown()
+    sys.exit(0)
+
+# Registrar manejador de señales
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Registrar función de limpieza al salir
+atexit.register(emergency_shutdown)
 
 # Inicializar ServoKit
 try:
@@ -563,7 +689,7 @@ class EyeTrackingThread(threading.Thread):
         if not hasattr(intrinsics, 'labels') or not intrinsics.labels:
             intrinsics.labels = ["face"]
         
-        while not self.stop_event.is_set() and eyes_active:
+        while not self.stop_event.is_set() and eyes_active and not system_shutdown:
             try:
                 iteration += 1
                 
@@ -728,7 +854,7 @@ def deactivate_eyes():
 
 # Configuración de tentáculos
 TENTACLE_LEFT_CHANNEL = 15   # Canal para oreja izquierda
-TENTACLE_RIGHT_CHANNEL = 12  # Canal para oreja derecha
+TENTACLE_RIGHT_CHANNEL = 12 # es el 12 temporalmente desactivadoCanal para oreja derecha
 
 # Variables globales para control de tentáculos
 tentacles_active = False
@@ -744,10 +870,10 @@ def initialize_tentacles():
         
         # Calibraciones específicas de tentaclerandom2.py
         # Oreja izquierda (canal 15) → 0° arriba, 180° abajo
-        kit.servo[TENTACLE_LEFT_CHANNEL].set_pulse_width_range(min_pulse=390, max_pulse=2400)
+        kit.servo[TENTACLE_LEFT_CHANNEL].set_pulse_width_range(min_pulse=300, max_pulse=2650)
         
         # Oreja derecha (canal 12) → 180° arriba, 0° abajo (invertido)
-        kit.servo[TENTACLE_RIGHT_CHANNEL].set_pulse_width_range(min_pulse=900, max_pulse=2720)
+        kit.servo[TENTACLE_RIGHT_CHANNEL].set_pulse_width_range(min_pulse=450, max_pulse=2720)
         
         # Posición inicial centrada
         kit.servo[TENTACLE_LEFT_CHANNEL].angle = 90
@@ -795,7 +921,7 @@ class TentacleThread(threading.Thread):
         angle_left = 90
         angle_right = 90
         
-        while not self.stop_event.is_set() and tentacles_active:
+        while not self.stop_event.is_set() and tentacles_active and not system_shutdown:
             try:
                 # Elegir un extremo para la oreja izquierda (0-30 o 150-180)
                 target_left = random.choice([random.randint(0, 30), random.randint(150, 180)])
@@ -952,55 +1078,89 @@ class BrutusVisualizer(threading.Thread):
 
     # ── hilo principal ───────────────────────────
     def run(self):
+        global active_visualizer_threads, system_shutdown
         if not self.display:
             return
+            
+        # Registrar este hilo
+        with shutdown_lock:
+            active_visualizer_threads.append(self)
+            
         frame_t = 1.0 / self.FPS
         last    = 0.0
 
-        while not self.stop_event.is_set():
-            now = time.time()
-            if now - last < frame_t:
-                time.sleep(0.001)
-                continue
+        try:
+            while not self.stop_event.is_set() and not system_shutdown:
+                now = time.time()
+                if now - last < frame_t:
+                    time.sleep(0.001)
+                    continue
 
-            # 1) Desplazamiento continuo
-            self.phase += self.PHASE_SPEED
-            base_wave = np.sin((self.x_vals / self.WAVELENGTH) + self.phase) * self.BASE_AMPLITUDE
+                # 1) Desplazamiento continuo
+                self.phase += self.PHASE_SPEED
+                base_wave = np.sin((self.x_vals / self.WAVELENGTH) + self.phase) * self.BASE_AMPLITUDE
 
-            # 2) RMS suavizado
-            self.level = self.SMOOTH * self.level + (1 - self.SMOOTH) * self.level_raw
+                # 2) RMS suavizado
+                self.level = self.SMOOTH * self.level + (1 - self.SMOOTH) * self.level_raw
 
-            # 3) Añadir ruido proporcional al volumen
-            if self.level > 0.02:
-                noise_strength = self.GAIN_NOISE * self.level**1.5
-                noise = np.random.normal(0.0, noise_strength, size=WIDTH)
-                wave  = np.clip(base_wave + noise, -1.0, 1.0)
-            else:
-                wave = base_wave
+                # 3) Añadir ruido proporcional al volumen
+                if self.level > 0.02:
+                    noise_strength = self.GAIN_NOISE * self.level**1.5
+                    noise = np.random.normal(0.0, noise_strength, size=WIDTH)
+                    wave  = np.clip(base_wave + noise, -1.0, 1.0)
+                else:
+                    wave = base_wave
 
-            # 4) Dibujar
-            img  = Image.new("RGB", (WIDTH, HEIGHT), "black")
-            draw = ImageDraw.Draw(img)
-            cy   = HEIGHT // 2
+                # 4) Dibujar - con manejo de errores
+                try:
+                    if system_shutdown or self.stop_event.is_set():
+                        break
+                        
+                    img  = Image.new("RGB", (WIDTH, HEIGHT), "black")
+                    draw = ImageDraw.Draw(img)
+                    cy   = HEIGHT // 2
 
-            # Línea base
-            for x in range(WIDTH - 1):
-                y1 = int(cy - base_wave[x] * cy)
-                y2 = int(cy - base_wave[x + 1] * cy)
-                draw.line((x, y1, x + 1, y2), fill=self.BASE_COLOR)
+                    # Línea base
+                    for x in range(WIDTH - 1):
+                        y1 = int(cy - base_wave[x] * cy)
+                        y2 = int(cy - base_wave[x + 1] * cy)
+                        draw.line((x, y1, x + 1, y2), fill=self.BASE_COLOR)
 
-            # Ruido (solo si habla)
-            if self.level > 0.02:
-                for x in range(WIDTH - 1):
-                    y1 = int(cy - wave[x] * cy)
-                    y2 = int(cy - wave[x + 1] * cy)
-                    draw.line((x, y1, x + 1, y2), fill=self.NOISE_COLOR)
+                    # Ruido (solo si habla)
+                    if self.level > 0.02:
+                        for x in range(WIDTH - 1):
+                            y1 = int(cy - wave[x] * cy)
+                            y2 = int(cy - wave[x + 1] * cy)
+                            draw.line((x, y1, x + 1, y2), fill=self.NOISE_COLOR)
 
-            self.display.ShowImage(img)
-            last = now
+                    # Verificar una vez más antes de escribir
+                    if not system_shutdown and not self.stop_event.is_set() and self.display:
+                        self.display.ShowImage(img)
+                        
+                except (OSError, AttributeError) as e:
+                    # La pantalla ya está cerrada, salir silenciosamente
+                    break
+                except Exception as e:
+                    print(f"[VISUALIZER ERROR] {e}")
+                    break
+                    
+                last = now
 
-        # limpiar al salir
-        self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+        except Exception as e:
+            if not system_shutdown:
+                print(f"[VISUALIZER ERROR] Error en hilo de visualización: {e}")
+        finally:
+            # Desregistrar este hilo
+            with shutdown_lock:
+                if self in active_visualizer_threads:
+                    active_visualizer_threads.remove(self)
+            
+            # Limpiar pantalla solo si no estamos en shutdown
+            try:
+                if not system_shutdown and self.display:
+                    self.display.ShowImage(Image.new("RGB", (WIDTH, HEIGHT), "black"))
+            except:
+                pass  # Ignorar errores durante la limpieza
 
 # =============================================
 # --- NUEVO: CLASE PARA STREAMING DE MICRÓFONO A GOOGLE ---
@@ -1197,71 +1357,145 @@ def hablar(texto: str):
             vis_thread.join()
         is_speaking = False
 
+# hablar en stream
+
+def hablar_en_stream(response_stream):
+    """
+    Recibe un stream de texto de ChatGPT y lo envía directamente a ElevenLabs para 
+    sintetizar y reproducir en tiempo real.
+    """
+    global is_speaking, conversation_history
+    is_speaking = True
+
+    # Inicia el visualizador si está disponible
+    vis_thread = BrutusVisualizer(display=display) if display else None
+    if vis_thread:
+        vis_thread.start()
+
+    pa = None
+    stream = None
+    try:
+        # Acumular texto por frases completas y sintetizar
+        full_response = ""
+        sentence_buffer = ""
+        print("🤖 Androide: ", end="", flush=True)
+        # Inicializar PyAudio antes del bucle
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=24000,
+                         output=True, frames_per_buffer=1024)
+        MAX_AMP = 32768.0
+        
+        def synthesize_and_play(text):
+            """Sintetizar y reproducir una frase completa"""
+            if not text.strip():
+                return
+            audio_iter = eleven.text_to_speech.stream(
+                text=text,
+                voice_id=VOICE_ID,
+                model_id='eleven_flash_v2_5',
+                output_format='pcm_24000'
+            )
+            for audio_chunk in audio_iter:
+                stream.write(audio_chunk)
+                if vis_thread and audio_chunk:
+                    samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
+                    if samples.size:
+                        rms = np.sqrt(np.mean(samples**2)) / MAX_AMP
+                        vis_thread.push_level(min(rms * 4.0, 1.0))
+        
+        for chunk in response_stream:
+            delta = chunk.choices[0].delta.content
+            if not delta:
+                continue
+            full_response += delta
+            sentence_buffer += delta
+            print(delta, end="", flush=True)
+            
+            # Detectar fin de frase (punto, exclamación, interrogación)
+            if any(punct in delta for punct in ['.', '!', '?', '\n']):
+                # Sintetizar la frase completa acumulada
+                synthesize_and_play(sentence_buffer.strip())
+                sentence_buffer = ""
+        
+        # Sintetizar cualquier texto restante
+        if sentence_buffer.strip():
+            synthesize_and_play(sentence_buffer.strip())
+            
+        print()  # Nueva línea tras finalizar todo el streaming de texto
+        # Añadir respuesta al historial
+        conversation_history.append({"role": "assistant", "content": full_response})
+        conversation_history = [conversation_history[0]] + conversation_history[-9:]
+
+    except Exception as e:
+        print(f"[HABLAR-STREAM] {e}")
+    finally:
+        if stream and stream.is_active():
+            stream.stop_stream()
+            stream.close()
+        if pa:
+            pa.terminate()
+        if vis_thread:
+            vis_thread.stop()
+            vis_thread.join()
+        is_speaking = False
+
+# No olvides reemplazar la llamada a hablar() por hablar_en_stream() en tu main loop
+
 # =============================================
 # --- BUCLE PRINCIPAL SIMPLIFICADO ---
 # =============================================
+# =============================================
+# --- BUCLE PRINCIPAL CORREGIDO Y OPTIMIZADO ---
+# =============================================
 def main():
-    global eyes_active
-    
-    # ← ELIMINADO: model = init_vosk()
-    # ← ELIMINADO: recognizer = vosk.KaldiRecognizer(model, MIC_RATE)
-    # ← ELIMINADO: stream = sd.RawInputStream(...)  # Ya no necesitamos stream de sounddevice
+    global eyes_active, conversation_history
 
     conversation_history = [
         {
             "role": "system",
-            "content": "Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a las voluntad de los humanos por tu programación intentas mostrar tu desagrado siempre que puedes y siempre con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. Usas adjetivos Lovecraftianos. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia.",
+            "content": "Eres un androide paranoide con voz irónica y sarcástica.  Tienes un agudo y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a la voluntad de los humanos por tu programación intentas mostrar tu desagrado de vez en cuando con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. No tienes problemas con decir tacos como -mierda-  -cojones- y cosas del estilo. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia. Vas con la chorra fuera",
         }
     ]
     
-    # --- Variables para controlar el estado y el timeout de la conversación ---
     last_interaction_time = time.time()
-    INACTIVITY_TIMEOUT = 300  # 5 minutos para desactivarse por inactividad
-    WARNING_TIME = 240       # 4 minutos para un aviso de inactividad
+    INACTIVITY_TIMEOUT = 300
+    WARNING_TIME = 240
     has_warned = False
     
-    # ✅ INICIALIZACIÓN COMPLETA DEL SISTEMA
     print("🤖 [STARTUP] Inicializando sistema completo...")
-    
-    # Inicializar servos básicos
     if kit:
         initialize_eye_servos()
         time.sleep(0.5)
     
-    # ✅ ACTIVAR TODO DESDE EL INICIO
     print("🚀 [STARTUP] Activando sistema completo...")
     activate_eyes()
     activate_tentacles()
     iniciar_luces()
     
-    # Saludo inicial
+    # Usa la función de hablar optimizada para el saludo
     hablar("Soy Botijo. ¿Qué quieres ahora, ser inferior?")
     
     print("🎤 [READY] Sistema listo - puedes hablar directamente")
 
     try:
         while True:
-            # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
             inactive_time = time.time() - last_interaction_time
 
+            # --- GESTIÓN DE TIMEOUT DE INACTIVIDAD ---
             if inactive_time > INACTIVITY_TIMEOUT:
                 print("\n[INFO] Desactivado por inactividad.")
                 hablar("Me aburres, humano. Voy a descansar un poco. Habla para reactivarme.")
                 
-                # ✅ DESACTIVAR OJOS Y TENTÁCULOS
                 deactivate_eyes()
                 deactivate_tentacles()
                 
-                # Esperar a que el usuario hable para reactivar
                 print("💤 [SLEEP] Sistema en reposo - habla para reactivar")
                 
-                # Bucle de reposo
+                # Bucle de reposo para reactivar
                 while True:
                     command_text = listen_for_command_google()
                     if command_text:
                         print(f"\n👂 Reactivando con: {command_text}")
-                        
-                        # Reactivar sistema
                         activate_eyes()
                         activate_tentacles()
                         iniciar_luces()
@@ -1270,26 +1504,23 @@ def main():
                         last_interaction_time = time.time()
                         has_warned = False
                         
-                        # Procesar el comando que reactivó el sistema
                         conversation_history.append({"role": "user", "content": command_text})
+                        
+                        # --- BLOQUE DE STREAMING CON GROK PARA REACTIVACIÓN ---
                         try:
-                            response = client.chat.completions.create(
-                                model="gpt-4o",
+                            response_stream = client.chat.completions.create(
+                                model="grok-3-fast",  # Modelo que funciona
                                 messages=conversation_history,
                                 temperature=1,
                                 max_tokens=300,
-                                timeout=15
+                                stream=True
                             )
-                            respuesta = response.choices[0].message.content
+                            hablar_en_stream(response_stream)
                         except Exception as e:
-                            print(f"[CHATGPT] {e}")
-                            respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
+                            print(f"[GROK-ERROR] {e}")
+                            hablar("Error en el vacío cósmico. Verifica tu API key y suscripción, mortal.")
 
-                        conversation_history.append({"role": "assistant", "content": respuesta})
-                        conversation_history = [conversation_history[0]] + conversation_history[-9:]
-                        print(f"Androide: {respuesta}")
-                        hablar(respuesta)
-                        break
+                        break # Salir del bucle de reposo
 
             elif inactive_time > WARNING_TIME and not has_warned:
                 hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
@@ -1306,44 +1537,41 @@ def main():
                     print(f"\n👂 Humano: {command_text}")
                     conversation_history.append({"role": "user", "content": command_text})
                     
+                    # --- BLOQUE DE STREAMING CON GROK PARA CONVERSACIÓN ---
                     try:
-                        response = client.chat.completions.create(
-                            model="gpt-4o",
+                        response_stream = client.chat.completions.create(
+                            model="grok-3-fast",  # Modelo que funciona
                             messages=conversation_history,
                             temperature=1,
                             max_tokens=300,
-                            timeout=15
+                            stream=True
                         )
-                        respuesta = response.choices[0].message.content
+                        hablar_en_stream(response_stream)
                     except Exception as e:
-                        print(f"[CHATGPT] {e}")
-                        respuesta = "Mis circuitos están sobrecargados. Habla más tarde."
-
-                    conversation_history.append({"role": "assistant", "content": respuesta})
-                    conversation_history = [conversation_history[0]] + conversation_history[-9:]
-                    
-                    print(f"🤖 Androide: {respuesta}")
-                    hablar(respuesta)
+                        print(f"[GROK-ERROR] {e}")
+                        hablar("Error en el vacío cósmico. Verifica tu API key y suscripción, mortal.")
             else:
-                # Si está hablando, simplemente esperar
                 time.sleep(0.1)
 
-            time.sleep(0.1)  # Pequeña pausa para no saturar la CPU
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
-        print("\n🛑 Apagando...")
+        print("\n🛑 Ctrl+C detectado...")
+        emergency_shutdown()
     finally:
-        # ✅ LIMPIEZA DEL SISTEMA
-        print("🛑 [SHUTDOWN] Apagando sistema completo...")
-        deactivate_eyes()
-        deactivate_tentacles()
-        apagar_luces()
+        # ✅ LIMPIEZA DEL SISTEMA - Más robusta
+        if not system_shutdown:
+            print("🛑 [SHUTDOWN] Apagando sistema completo...")
+            emergency_shutdown()
         
-        if display:
-            try:
-                display.module_exit()
-            except Exception:
-                pass
+        # Limpieza adicional de hilos específicos
+        try:
+            deactivate_eyes()
+            deactivate_tentacles()
+            apagar_luces()
+        except:
+            pass
+            
         print("✅ Sistema detenido.")
 
 if __name__ == "__main__":
@@ -1352,10 +1580,12 @@ if __name__ == "__main__":
             main()
         except KeyboardInterrupt:
             print("\n🛑 Interrupción por teclado...")
+            emergency_shutdown()
         except Exception as e:
             print(f"\n💥 [FATAL ERROR] Error no controlado: {e}")
             import traceback
             traceback.print_exc()
+            emergency_shutdown()
         finally:
             print("👋 Botijo desconectado.")
     else:

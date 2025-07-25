@@ -1030,9 +1030,9 @@ def audio_callback(indata, frames, time_info, status):
     if is_listening_for_command:
         # Enviar bytes brutos para STT
         try:
-            chunk = indata if isinstance(indata, (bytes, bytearray)) else indata.tobytes()
+            chunk = indat if isinstance(indat, (bytes, bytearray)) else indat.tobytes()
         except Exception:
-            chunk = bytes(indata)
+            chunk = bytes(indat)
         stt_audio_queue.put(chunk)
         # Depuración: mostrar tamaño de fragmento y tamaño de cola
         print(f"[DEBUG STT] Chunk recibido: {len(chunk)} bytes, cola={stt_audio_queue.qsize()}")
