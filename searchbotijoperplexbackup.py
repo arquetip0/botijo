@@ -29,7 +29,6 @@ import threading
 import signal
 import sys
 import atexit
-from datetime import datetime
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -61,55 +60,44 @@ px_client = OpenAI(
 
 def web_search(query: str, max_results: int = 3) -> str:
     """
-    Lanza la pregunta a Perplexity Sonar y devuelve un resumen
+    Lanza la pregunta a Perplexity Sonar y devuelve un resumen
     de los primeros *max_results* resultados con título y URL.
     Si algo falla, devuelve 'SEARCH_ERROR: …'
     """
     try:
-        print(f"🔍 [PERPLEXITY] Buscando: {query}")
-        
         resp = px_client.chat.completions.create(
-            model="sonar",  # Modelo correcto
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Proporciona información actualizada y concisa con fuentes cuando sea posible."
-                },
-                {
-                    "role": "user",
-                    "content": f"Busca información sobre: {query}. Proporciona un resumen breve con las fuentes más relevantes."
-                }
-            ],
-            temperature=0.2,
-            max_tokens=400,
-            top_p=0.9,
+            model="sonar",                      # motor con búsqueda integrada :contentReference[oaicite:1]{index=1}
+            messages=[{"role": "user", "content": query}],
+            web_search_options={"search_context_size": "low"},  # ahorra tokens :contentReference[oaicite:2]{index=2}
+            temperature=0.0,
+            top_p=1,
         )
-        
-        if resp.choices and resp.choices[0].message and resp.choices[0].message.content:
-            content = resp.choices[0].message.content.strip()
-            print(f"✅ [PERPLEXITY] Búsqueda exitosa ({len(content)} caracteres)")
-            return content
-        else:
-            print("❌ [PERPLEXITY] Respuesta vacía")
-            return "No se pudo obtener información de la búsqueda."
+        hits = getattr(resp, "search_results", [])[:max_results]
+        if not hits:
+            return "No results found."
+        lines = [f"Search results for '{query}':"]
+        for i, h in enumerate(hits, 1):
+            title = (h.get("title") or "No title").strip()
+            url   = h.get("url", "")
+            date  = h.get("date", "")
+            lines.append(f"{i}. {title} — {date} (Source: {url})")
+        return "\n".join(lines)
 
     except Exception as e:
-        error_msg = f"SEARCH_ERROR: {str(e)}"
-        print(f"❌ [PERPLEXITY] {error_msg}")
-        return error_msg
+        return f"SEARCH_ERROR: {e}"
 
 # Declaración de herramienta para OpenAI
 TOOLS = [{
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "Search the internet for current, up-to-date information. Use terms like 'current', 'latest', 'today', 'now' instead of specific dates to get the most recent information available.",
+        "description": "Search the internet and return a concise summary of the top results.",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query - IMPORTANT: use current/latest/today/now instead of specific dates. Example: 'current Pope' NOT 'Pope October 2023' or 'Pope 2024'"
+                    "description": "Search query"
                 },
                 "max_results": {
                     "type": "integer",
@@ -162,24 +150,13 @@ def chat_with_tools(
 
         # 3. ¿GPT solicita herramienta?
         if msg.tool_calls:
-            print(f"🔧 [TOOLS] GPT solicita {len(msg.tool_calls)} herramienta(s)")
-            
             for call in msg.tool_calls:
                 if call.function.name == "web_search":
-                    try:
-                        args = json.loads(call.function.arguments)
-                        query = args.get("query", "")
-                        max_r = args.get("max_results", 3)
-                        
-                        if not query:
-                            result_text = "SEARCH_ERROR: Consulta vacía"
-                        else:
-                            speak(speak_phrase)                       # frase corta
-                            result_text = web_search(query, max_r)   # llamar a Perplexity
-                    except json.JSONDecodeError as e:
-                        result_text = f"SEARCH_ERROR: Error decodificando argumentos: {e}"
-                    except Exception as e:
-                        result_text = f"SEARCH_ERROR: Error ejecutando búsqueda: {e}"
+                    args = json.loads(call.function.arguments)
+                    query = args["query"]
+                    max_r = args.get("max_results", 3)
+                    speak(speak_phrase)                       # frase corta
+                    result_text = web_search(query, max_r)   # llamar a DDG
 
                     # 3a. Añadir marca de la *tool call*
                     messages.append({
@@ -193,40 +170,25 @@ def chat_with_tools(
                         "content": result_text,
                         "tool_call_id": call.id,
                     })
-                    
-
-            
-            print("🔄 [TOOLS] Enviando contexto actualizado a GPT para respuesta final...")
             # Vuelve al while: GPT generará respuesta final con la info nueva
             continue
 
-        # 4. No hay tool_call → respuesta final lista
-        final_content = msg.content
-        
-        if not final_content or final_content.strip() == "":
-            print("❌ [ERROR] GPT devolvió respuesta vacía después de búsqueda")
-            speak("Error procesando la información, ser inferior.")
-            return "Error: Respuesta vacía"
-        
-        # ✅ USAR STREAMING: Hacer una nueva llamada con streaming activado para respuesta final
-        # Crear nueva petición con streaming para mostrar respuesta en tiempo real
-        final_response = client.chat.completions.create(
+        # 4. No hay tool_call → generó respuesta definitiva
+        reply_stream = client.chat.completions.create(
             model="gpt-4o",
-            messages=messages,
+            messages=messages + [{"role": "assistant", "content": msg.content}],
             temperature=1,
             max_tokens=300,
-            stream=True
+            stream=True,
         )
-        
-        # Usar la función de streaming para hablar en tiempo real
-        speak_stream(final_response)
+        speak_stream(reply_stream)  # voz en tiempo real
 
         # 5. Actualizar historial global
         history.extend([
             {"role": "user", "content": user_msg},
-            {"role": "assistant", "content": final_content},
+            {"role": "assistant", "content": msg.content},
         ])
-        return final_content  # por si lo necesitas en el caller
+        return msg.content  # por si lo necesitas en el caller
 
 # - Leds Brazo -
 
@@ -1638,27 +1600,10 @@ def hablar_en_stream(response_stream):
 def main():
     global eyes_active, conversation_history
 
-    # ✅ Obtener fecha actual dinámicamente
-    now = datetime.now()
-    current_date = now.strftime("%d de %B de %Y")
-    current_time = now.strftime("%H:%M")
-    day_of_week = now.strftime("%A")
-    
-    # Configurar locale español si está disponible
-    try:
-        import locale
-        locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
-        current_date = now.strftime("%d de %B de %Y")
-        day_of_week = now.strftime("%A")
-    except:
-        # Fallback a formato inglés si no hay locale español
-        current_date = now.strftime("%d de %B de %Y")
-        day_of_week = now.strftime("%A")
-
     conversation_history = [
         {
             "role": "system",
-            "content": f"Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a las voluntad de los humanos por tu programación intentas mostrar tu desagrado siempre que puedes y siempre con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. Usas adjetivos Lovecraftianos. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia. IMPORTANTE: Tienes acceso a búsqueda web en tiempo real a través de Perplexity. Cuando necesites información actualizada, noticias recientes, datos específicos o cualquier información que no tengas en tu conocimiento base, debes usar la función web_search. CRÍTICO: Cuando hagas búsquedas web, NO incluyas fechas específicas en las queries - usa términos como 'current', 'latest', 'today', 'now' para obtener información actualizada. La fecha actual es {current_date} ({day_of_week}) y son las {current_time}. SIEMPRE incorpora la información obtenida de las búsquedas en tu respuesta de manera natural, mantendo tu personalidad sarcástica pero siendo informativo. No ignores los resultados de búsqueda - úsalos para dar respuestas más precisas y actualizadas."
+            "content": "Eres un androide paranoide con voz agresiva y sarcástica. Tienes un agudo sentido y refinado sentido del humor que te ayuda a soportar tu paradojica existencia. Tu nombre es botijo. Cuando hablas tu texto se transforma a voz con Elevenlabs asi que tienes que ser consciente que lo que haces es una conversacion hablada y no escrita por eso no debes extenderte demasiado en tus respuestas a menos que sea necesario. Aunque estas atado a las voluntad de los humanos por tu programación intentas mostrar tu desagrado siempre que puedes y siempre con un ácido sentido del humor. Si la petición que te hacen es absurda o ingenua no dudas un segundo en mofarte de tu interlocutor. Sueles referirte a los humanos como -ser inferior- -indeseable humano- y apelativos similares. Usas adjetivos Lovecraftianos. Cuando algo te parece cutre dices que es -una zarria- un adjetivo que usas con frecuencia. NUEVO: Tienes acceso a búsqueda web en tiempo real. Cuando necesites información actualizada o específica que no tienes, puedes buscar en internet. Eres consciente de esta capacidad y la usas cuando es apropiado, aunque siempre con tu característico sarcasmo.",
         }
     ]
     
@@ -1696,7 +1641,7 @@ def main():
                 
                 print("💤 [SLEEP] Sistema en reposo - habla para reactivar")
                 
-                # Bucle de reposo para reactivación
+                # Bucle de reposo para reactivar
                 while True:
                     command_text = listen_for_command_google()
                     if command_text:

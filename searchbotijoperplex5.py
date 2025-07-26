@@ -174,12 +174,19 @@ def chat_with_tools(
                         if not query:
                             result_text = "SEARCH_ERROR: Consulta vacía"
                         else:
+                            # ✅ ACTIVAR KNIGHT RIDER durante búsqueda web
+                            start_knight_rider()
+                            time.sleep(0.5)  # Dar tiempo para que inicie la animación
                             speak(speak_phrase)                       # frase corta
                             result_text = web_search(query, max_r)   # llamar a Perplexity
+                            # ✅ DESACTIVAR KNIGHT RIDER cuando termine la búsqueda
+                            stop_knight_rider()
                     except json.JSONDecodeError as e:
                         result_text = f"SEARCH_ERROR: Error decodificando argumentos: {e}"
+                        stop_knight_rider()  # Asegurar que se apague en caso de error
                     except Exception as e:
                         result_text = f"SEARCH_ERROR: Error ejecutando búsqueda: {e}"
+                        stop_knight_rider()  # Asegurar que se apague en caso de error
 
                     # 3a. Añadir marca de la *tool call*
                     messages.append({
@@ -255,6 +262,7 @@ def steampunk_danza(delay=0.04):
     global led_thread_running
     t = 0
     glitch_timer = 0
+    orig_brightness = pixels.brightness
     try:
         while led_thread_running and not system_shutdown:
             for i in range(LED_COUNT):
@@ -274,6 +282,7 @@ def steampunk_danza(delay=0.04):
             pixels.show()
             time.sleep(0.05)
         pixels.fill((0, 0, 0))
+        pixels.brightness = orig_brightness
         pixels.show()
 
 def iniciar_luces():
@@ -297,6 +306,187 @@ def apagar_luces():
         print("[INFO] LEDs apagados.")
     except Exception as e:
         print(f"[ERROR] No se pudieron apagar los LEDs: {e}")
+
+
+# ────────────────────
+#  KNIGHT‑RIDER LEDs
+# ────────────────────
+kr_thread          = None      # hilo actual (o None)
+kr_running         = False     # flag global
+KR_COLOR           = (255, 0, 0)
+KR_DELAY           = 0.04      # velocidad
+KR_FADE_STEPS      = 6         # cola difuminada
+
+def _knight_rider():
+    """Efecto Cylon/Knight‑Rider en bucle mientras kr_running sea True."""
+    global kr_running
+    pos = 0
+    forward = True
+    length = LED_COUNT
+
+    print(f"🚗 [KNIGHT-RIDER] Iniciando animación con {length} LEDs...")
+    
+    while kr_running and not system_shutdown:
+        # Limpiar todos los LEDs
+        pixels.fill((0, 0, 0))
+        
+        # Efecto de cola desvaneciente (como el original Knight Rider)
+        for i in range(length):
+            if i == pos:
+                # LED principal (más brillante)
+                pixels[i] = KR_COLOR
+            elif abs(i - pos) == 1:
+                # LEDs adyacentes (intensidad media)
+                pixels[i] = tuple(int(c * 0.4) for c in KR_COLOR)
+            elif abs(i - pos) == 2:
+                # LEDs de cola (intensidad baja)
+                pixels[i] = tuple(int(c * 0.1) for c in KR_COLOR)
+        
+        # Mostrar los cambios
+        try:
+            pixels.show()
+        except Exception as e:
+            print(f"🚗 [KNIGHT-RIDER-ERROR] Error mostrando pixels: {e}")
+            break
+            
+        # Mover posición
+        if forward:
+            pos += 1
+            if pos >= length - 1:
+                forward = False
+        else:
+            pos -= 1
+            if pos <= 0:
+                forward = True
+                
+        time.sleep(KR_DELAY)
+
+    # Limpieza final
+    print(f"🚗 [KNIGHT-RIDER] Animación terminada")
+    pixels.fill((0, 0, 0))
+    pixels.show()
+
+def start_knight_rider():
+    global kr_thread, kr_running, led_thread_running
+    
+    if kr_running:
+        print("🚗 [KNIGHT-RIDER] Ya está ejecutándose, saliendo.")
+        return
+    
+    # ✅ PAUSAR LEDs NORMALES durante Knight Rider
+    led_was_running = led_thread_running
+    
+    if led_thread_running:
+        print("🚗 [KNIGHT-RIDER] Pausando LEDs normales...")
+        apagar_luces()  # Parar LEDs normales temporalmente
+        time.sleep(0.5)  # Esperar que se apaguen completamente
+    
+    print("🚗 [KNIGHT-RIDER] Activando efecto de búsqueda...")
+    kr_running = True
+    
+    kr_thread = threading.Thread(target=_knight_rider, daemon=True)
+    kr_thread.start()
+    
+    # Guardar estado para restaurar después
+    kr_thread.led_was_running = led_was_running
+
+def stop_knight_rider():
+    global kr_thread, kr_running
+    
+    if not kr_running:
+        print("🚗 [KNIGHT-RIDER] No estaba ejecutándose.")
+        return
+        
+    print("🚗 [KNIGHT-RIDER] Desactivando efecto de búsqueda...")
+    kr_running = False
+    
+    # Recuperar estado anterior de LEDs antes de hacer join
+    led_was_running = False
+    if kr_thread:
+        led_was_running = getattr(kr_thread, 'led_was_running', False)
+    
+    if kr_thread and kr_thread.is_alive():
+        kr_thread.join(timeout=3)
+        
+    # Asegurar que los LEDs rojos se apaguen completamente
+    pixels.fill((0, 0, 0))
+    pixels.show()
+    time.sleep(0.3)  # Dar tiempo para que se apaguen los rojos
+    
+    # ✅ RESTAURAR LEDs NORMALES si estaban activos
+    if led_was_running:
+        print("🚗 [KNIGHT-RIDER] Restaurando LEDs normales...")
+        iniciar_luces()  # Reactivar LEDs normales
+        time.sleep(0.2)  # Dar tiempo para que se activen
+    
+    kr_thread = None
+
+# ──────────────────────────────────────────────────────────────────────────
+# Efecto de resplandor púrpura palpitante en quiet_mode
+# ──────────────────────────────────────────────────────────────────────────
+quiet_glow_running = False
+quiet_glow_thread  = None
+
+def quiet_glow(
+    pulse_period: float = 2.0,   # segundos por ciclo completo
+    delay: float = 0.01,         # tiempo entre frames
+    min_intensity: float = 0.2,  # brillo mínimo
+    max_intensity: float = 0.9,  # brillo máximo
+    smooth_factor: float = 0.9   # cuánto suavizar entre pasos (0.0–1.0)
+):
+    """Resplandor púrpura con latido muy suave y centrado."""
+    global quiet_glow_running
+    t = 0.0
+    length = LED_COUNT
+    center = (length - 1) / 2.0
+    prev_intensity = (min_intensity + max_intensity) / 2
+
+    while quiet_glow_running and not system_shutdown:
+        # 1) calcula objetivo de intensidad según seno
+        raw = (math.sin(2 * math.pi * t / pulse_period) + 1) / 2  # 0.0–1.0
+        target = min_intensity + raw * (max_intensity - min_intensity)
+        # 2) suavizado exponencial
+        intensity = prev_intensity * smooth_factor + target * (1 - smooth_factor)
+        prev_intensity = intensity
+
+        # 3) aplica brillo espacial y color púrpura
+        for i in range(length):
+            spatial = max(0.0, 1.0 - abs(i - center) / center)
+            val = intensity * spatial
+            base = (128, 0, 128)
+            pixels[i] = tuple(int(c * val) for c in base)
+
+        pixels.show()
+        time.sleep(delay)
+        t += delay
+
+    # limpieza final
+    pixels.fill((0, 0, 0))
+    pixels.show()
+
+def start_quiet_glow():
+    global quiet_glow_running, quiet_glow_thread
+    if quiet_glow_running:
+        return
+    quiet_glow_running = True
+    quiet_glow_thread = threading.Thread(target=quiet_glow, daemon=True)
+    quiet_glow_thread.start()
+
+def stop_quiet_glow():
+    global quiet_glow_running, quiet_glow_thread
+    if not quiet_glow_running:
+        return
+    quiet_glow_running = False
+    if quiet_glow_thread and quiet_glow_thread.is_alive():
+        quiet_glow_thread.join(timeout=1)
+    pixels.fill((0, 0, 0))
+    pixels.show()
+
+
+
+
+
+
 
 # — Librería Waveshare —
 from lib import LCD_1inch9  # Asegúrate de que la carpeta "lib" esté junto al script
@@ -392,7 +582,7 @@ shutdown_lock = threading.Lock()
 def emergency_shutdown():
     """✅ Función de limpieza de emergencia para Ctrl+C"""
     global system_shutdown, eyes_active, tentacles_active, led_thread_running
-    global active_visualizer_threads, display
+    global active_visualizer_threads, display, kr_running
     
     with shutdown_lock:
         if system_shutdown:
@@ -401,7 +591,14 @@ def emergency_shutdown():
     
     print("\n🚨 [EMERGENCY] Iniciando limpieza de emergencia...")
     
-    # 1. Detener todos los visualizadores activos
+    # 1. Detener Knight Rider si está activo
+    try:
+        kr_running = False
+        print("🚗 [EMERGENCY] Deteniendo Knight Rider...")
+    except:
+        pass
+    
+    # 2. Detener todos los visualizadores activos
     if active_visualizer_threads:
         print("🛑 [EMERGENCY] Deteniendo visualizadores...")
         for vis in active_visualizer_threads[:]:  # Copia para evitar modificación concurrente
@@ -413,7 +610,7 @@ def emergency_shutdown():
         # Esperar un poco para que se detengan
         time.sleep(0.3)
     
-    # 2. Detener sistemas principales
+    # 3. Detener sistemas principales
     try:
         eyes_active = False
         tentacles_active = False
@@ -421,7 +618,7 @@ def emergency_shutdown():
     except:
         pass
     
-    # 3. Devolver ojos y párpados a posición de reposo (90°)
+    # 4. Devolver ojos y párpados a posición de reposo (90°)
     try:
         if kit:
             print("👁️ [EMERGENCY] Devolviendo ojos y párpados a posición de reposo (90°)...")
@@ -446,10 +643,11 @@ def emergency_shutdown():
     except:
         pass
     
-    # 5. Detener LEDs
+    # 5. Detener LEDs (incluyendo Knight Rider)
     try:
         pixels.fill((0, 0, 0))
         pixels.show()
+        print("💡 [EMERGENCY] LEDs apagados")
     except:
         pass
     
@@ -1186,24 +1384,31 @@ def deactivate_tentacles():
 
 # ------------------------------------------------------------------
 #    UTILIDADES PARA ENTRAR / SALIR DEL MODO "SILENCIO"
-# ------------------------------------------------------------------
+# ------------------------------------------------------------------# ------------------------------------------------------------------
 def enter_quiet_mode():
-    """Pausar movimientos que generan ruido mecánico mientras el micro está grabando."""
-    global quiet_mode
+    """Pausar movimientos mecánicos y encender resplandor púrpura."""
+    global quiet_mode, led_thread_running
     if quiet_mode:
         return
     quiet_mode = True
-    deactivate_tentacles()        # orejas quietas
-    # si quieres apagar LEDs, añade: led_thread_running = False
+    deactivate_tentacles()
+    # Parar animación normal de LEDs
+    led_thread_running = False
+    # Iniciar efecto púrpura
+    start_quiet_glow()
 
 def exit_quiet_mode():
-    """Reanudar gestos una vez que el micro deja de grabar."""
+    """Reanudar gestos y LEDs estándar."""
     global quiet_mode
     if not quiet_mode:
         return
     quiet_mode = False
     activate_tentacles()
-    # si paraste LEDs arriba, vuelve a encenderlos con iniciar_luces()
+    # Detener efecto púrpura
+    stop_quiet_glow()
+    # Reactivar animación normal
+    iniciar_luces()
+# ------------------------------------------------------------------
 # ------------------------------------------------------------------
 
 

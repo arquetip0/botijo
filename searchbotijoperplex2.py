@@ -194,7 +194,9 @@ def chat_with_tools(
                         "tool_call_id": call.id,
                     })
                     
-
+                    # Debug: mostrar que se añadió el resultado de la búsqueda
+                    print(f"🔍 [DEBUG] Resultado de búsqueda añadido al contexto: {result_text[:100]}...")
+                    print(f"📊 [DEBUG] Historial ahora tiene {len(messages)} mensajes")
             
             print("🔄 [TOOLS] Enviando contexto actualizado a GPT para respuesta final...")
             # Vuelve al while: GPT generará respuesta final con la info nueva
@@ -202,24 +204,16 @@ def chat_with_tools(
 
         # 4. No hay tool_call → respuesta final lista
         final_content = msg.content
+        print(f"🤖 [DEBUG] GPT respuesta final: {final_content[:100]}...")
         
         if not final_content or final_content.strip() == "":
             print("❌ [ERROR] GPT devolvió respuesta vacía después de búsqueda")
             speak("Error procesando la información, ser inferior.")
             return "Error: Respuesta vacía"
         
-        # ✅ USAR STREAMING: Hacer una nueva llamada con streaming activado para respuesta final
-        # Crear nueva petición con streaming para mostrar respuesta en tiempo real
-        final_response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            temperature=1,
-            max_tokens=300,
-            stream=True
-        )
-        
-        # Usar la función de streaming para hablar en tiempo real
-        speak_stream(final_response)
+        # ✅ CORRECCIÓN: Usar la función de hablar normal en lugar de stream
+        # porque ya tenemos el contenido completo
+        speak(final_content)
 
         # 5. Actualizar historial global
         history.extend([
