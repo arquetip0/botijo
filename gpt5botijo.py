@@ -36,6 +36,11 @@ from datetime import datetime
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# --- GPT-5 configuration ---
+GPT5_MODEL = "gpt-5"          # modelo de conversación
+GPT5_VERBOSITY = "low"        # 'low' | 'medium' | 'high'
+GPT5_REASONING = "minimal"    # 'minimal' | 'low' | 'medium' | 'high'
+
 
 # ────────────────────────────────────────────────────────────────────────
 #SILENCIO MIENTRAS ESCUCHA
@@ -244,12 +249,12 @@ def chat_with_tools(
     while True:
         # 2. ✅ PRIMERA LLAMADA CON STREAMING ACTIVADO
         stream = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
             temperature=1,
-            max_tokens=300,
+            max_completion_tokens=300,
             stream=True  # ← CLAVE: streaming desde el inicio
         )
 
@@ -399,12 +404,12 @@ def chat_with_tools_generator(
     while True:
         # 4. Primera llamada con streaming Y personalidad
         stream = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
             temperature=1,
-            max_tokens=300,
+            max_completion_tokens=300,
             stream=True
         )
 
@@ -503,6 +508,59 @@ def chat_with_tools_generator(
             print("✅ [OPTIMIZED] Respuesta directa sin segunda llamada - tokens ahorrados!")
         
         return  # Terminar el generador
+
+# --- GPT-5 streaming via Responses API (con fallback seguro) ---
+def gpt5_stream_generator(messages):
+    """
+    Generador de texto usando Responses API (GPT‑5) con web_search nativo.
+    Acepta 'messages' estilo chat [{'role': 'system'|'user'|'assistant', 'content': '...'}].
+    Emite texto incremental apto para hablar_generador().
+    Si la Responses API no está disponible, hace fallback a Chat Completions con stream.
+    """
+    try:
+        # Responses API streaming
+        with client.responses.stream(
+            model=GPT5_MODEL,
+            input=messages,
+            tools=[{"type": "web_search"}],
+            reasoning={"effort": GPT5_REASONING},
+            verbosity=GPT5_VERBOSITY,
+            max_output_tokens=300,
+        ) as stream:
+            for event in stream:
+                t = getattr(event, "type", "")
+                if t == "response.output_text.delta":
+                    yield event.delta
+        return
+    except Exception as e:
+        print(f"[GPT5] Responses API no disponible, fallback a Chat Completions: {e}")
+        try:
+            stream = client.chat.completions.create(
+                model=GPT5_MODEL,
+                messages=messages,
+                stream=True,
+                temperature=1,
+            )
+            for chunk in stream:
+                if chunk.choices:
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        yield delta.content
+        except Exception as e2:
+            print(f"[GPT5] Fallback also failed: {e2}")
+
+
+def chat_with_gpt5_stream(history: list, user_msg: str, max_history: int = 10):
+    """
+    Envoltorio para crear mensajes con personalidad y devolver un generador GPT‑5 listo para hablar_generador().
+    """
+    ensure_system(history)
+    # Purgar historial preservando sistema
+    trimmed = history[-max_history:]
+    if not trimmed or (history and history[0].get("role") == "system" and trimmed[0] is not history[0]):
+        trimmed = [history[0]] + trimmed
+    messages = trimmed + [{"role": "user", "content": user_msg}]
+    return gpt5_stream_generator(messages)
 
 # - Leds Brazo -
 

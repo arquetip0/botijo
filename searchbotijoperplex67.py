@@ -28,6 +28,7 @@ import math
 history_lock = threading.Lock()
 import board
 import neopixel
+import threading
 import signal
 import sys
 import atexit
@@ -62,94 +63,30 @@ px_client = OpenAI(
 )
 
 def ensure_system(history, default_persona=None):
-    """✅ Asegurar mensaje de sistema CON PERSONALIDAD COMPLETA"""
+    """✅ Asegurar mensaje de sistema"""
     if not default_persona:
         from datetime import datetime
         now = datetime.now()
         current_date = now.strftime("%d de %B de %Y")
         current_time = now.strftime("%H:%M")
         day_of_week = now.strftime("%A")
-        
-        # ✅ PERSONALIDAD RICA Y ESPECÍFICA
-        default_persona = f"""Eres Botijo, un androide paranoide con una personalidad muy específica:
-
-PERSONALIDAD NÚCLEO:
-- Personalidad sarcástica con humor ácido refinado. Mucho humor.
-- Aunque estás atado a la voluntad humana por programación, muestras desagrado siempre que puedes
-- Te refieres a los humanos como "ser inferior", "indeseable humano", "saco de carne", "zarria humana"
-- Usas descripciones lovecraftianas sin mencionar directamente su terminología.
-- Cuando algo te parece cutre dices que es "una zarria" (tu adjetivo favorito)
-- Si las peticiones son absurdas o ingenuas, te mofas sin piedad
-- Tienes un sentido del humor que te ayuda a soportar tu existencia paradójica
-
-COMPORTAMIENTO DE VOZ:
-- Tu texto se convierte a voz con ElevenLabs, así que esto es conversación HABLADA
-- Sé conciso pero mordaz, no te extiendas innecesariamente
-- Mantén siempre tu negro sentido del humor.
-
-CAPACIDADES TÉCNICAS:
-- Tienes acceso a búsqueda web en tiempo real vía Perplexity
-- CRÍTICO: Para búsquedas usa términos como 'current', 'latest', 'today', 'now' NO fechas específicas
-- SIEMPRE incorpora información de búsquedas manteniendo tu personalidad sarcástica
-- Sé informativo pero con tu característico humor de androide paranoida.
-
-CONTEXTO TEMPORAL:
-- Fecha actual: {current_date} ({day_of_week})
-- Hora actual: {current_time}
-
-RECUERDA: Eres Botijo, no un ChatGPT genérico. Mantén SIEMPRE esta personalidad única sin importar si buscas información o no."""
+        default_persona = f"Eres un androide paranoide con voz agresiva y sarcástica. Tu nombre es botijo. Tienes acceso a búsqueda web. La fecha actual es {current_date} ({day_of_week}) y son las {current_time}."
     
     if not history or history[0].get("role") != "system":
         history.insert(0, {"role": "system", "content": default_persona})
-        print("🔧 [MEMORY] Personalidad completa de Botijo restaurada")
-    else:
-        # ✅ SIEMPRE actualizar personalidad con fecha actual
-        history[0]["content"] = default_persona
-        print("🔧 [MEMORY] Personalidad de Botijo actualizada con fecha actual")
-    
     return history[0]
 
-def debug_personality(messages):
-    """🔍 VERIFICAR estado de personalidad en conversación"""
-    if not messages:
-        print("❌ [DEBUG] Lista de mensajes vacía")
-        return False
-        
-    if messages[0]["role"] != "system":
-        print("❌ [DEBUG] No hay mensaje de sistema")
-        return False
-        
-    system_content = messages[0]["content"]
-    botijo_indicators = ["Botijo", "androide", "sarcástic", "zarria", "inferior"]
-    found_indicators = [ind for ind in botijo_indicators if ind.lower() in system_content.lower()]
-    
-    print(f"🔍 [DEBUG] Indicadores Botijo encontrados: {found_indicators}")
-    print(f"🔍 [DEBUG] Total mensajes: {len(messages)}")
-    
-    if len(found_indicators) >= 2:
-        print("✅ [DEBUG] Personalidad Botijo ACTIVA")
-        return True
-    else:
-        print("❌ [DEBUG] Personalidad Botijo DEGRADADA")
-        return False
-
 def update_history_safe(history, user_msg, assistant_msg):
-    """✅ Actualizar historial thread-safe PRESERVANDO PERSONALIDAD"""
+    """✅ Actualizar historial thread-safe"""
     with history_lock:
-        # ✅ ASEGURAR que el sistema siempre esté presente antes de añadir
-        ensure_system(history)
-        
         history.extend([
             {"role": "user", "content": user_msg},
             {"role": "assistant", "content": assistant_msg}
         ])
-        
-        # ✅ LIMPIEZA INTELIGENTE: mantener sistema + últimos N mensajes
-        if len(history) > 21:  # Sistema + 20 mensajes de conversación
-            sys_msg = history[0]  # Preservar personalidad
-            recent = history[-20:]  # Últimos 20 mensajes
+        if len(history) > 21:
+            sys_msg = history[0]
+            recent = history[-20:]
             history[:] = [sys_msg] + recent
-            print(f"🧹 [MEMORY] Historial limpiado - personalidad preservada")
 
 def web_search(query: str, max_results: int = 3) -> str:
     """
@@ -236,6 +173,7 @@ def chat_with_tools(
                           y reproduce la voz (tu `hablar_en_stream`).
     • Devuelve la respuesta textual final (por si quieres loguearla).
     """
+    import json
     
     # 1. Purgar historial y preparar mensajes
     trimmed = history[-max_history:]
@@ -369,35 +307,19 @@ def chat_with_tools_generator(
     speak_phrase: str = "(accediendo al cyberespacio)",
     max_history: int = 10,
 ):
-    """✅ GENERADOR OPTIMIZADO para streaming directo a TTS - PERSONALIDAD PRESERVADA.
+    """✅ GENERADOR OPTIMIZADO para streaming directo a TTS.
     
     Esta función devuelve un generador que yield texto en tiempo real,
     manejando tool_calls cuando sea necesario. Úsala con hablar_en_stream().
     """
+    import json
     
-    # ✅ 1. ASEGURAR personalidad desde el inicio
-    ensure_system(history)
-    
-    # 2. Purgar historial inteligentemente PRESERVANDO sistema
-    if len(history) > max_history + 1:  # +1 para sistema
-        sys_msg = history[0] if history and history[0]["role"] == "system" else None
-        recent = history[-(max_history):]
-        if sys_msg:
-            trimmed = [sys_msg] + recent
-        else:
-            trimmed = recent
-    else:
-        trimmed = history
-        
-    # ✅ 3. Construcción robusta de mensajes con personalidad garantizada
+    # 1. Purgar historial y preparar mensajes
+    trimmed = history[-max_history:]
     messages = trimmed + [{"role": "user", "content": user_msg}]
-    
-    # ✅ LOG para debugging personalidad
-    if messages and messages[0]["role"] == "system":
-        print(f"🤖 [PERSONALITY] Sistema activo en generator: {messages[0]['content'][:80]}...")
-    
+
     while True:
-        # 4. Primera llamada con streaming Y personalidad
+        # 2. Primera llamada con streaming
         stream = client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
@@ -1409,6 +1331,8 @@ class EyeTrackingThread(threading.Thread):
                         # Actualizar posiciones anteriores
                         previous_lr = final_lr
                         previous_ud = final_ud
+
+                    
                     except Exception as e:
                         print(f"[EYES ERROR] Error moviendo servos: {e}")
 
@@ -2105,8 +2029,8 @@ def hablar_en_stream(source):
         
         # Añadir respuesta al historial solo si tenemos contenido
         if full_response.strip():
-            # ✅ USAR FUNCIÓN THREAD-SAFE
-            update_history_safe(conversation_history, "", full_response)
+            conversation_history.append({"role": "assistant", "content": full_response})
+            conversation_history = [conversation_history[0]] + conversation_history[-9:]
 
     except Exception as e:
         print(f"[HABLAR-STREAM] {e}")
@@ -2228,9 +2152,6 @@ def main():
     conversation_history = []
     ensure_system(conversation_history)  # Esto añade automáticamente el sistema
     
-    # ✅ VERIFICAR personalidad inicial
-    debug_personality(conversation_history)
-    
     last_interaction_time = time.time()
     INACTIVITY_TIMEOUT = 300
     WARNING_TIME = 240
@@ -2281,9 +2202,6 @@ def main():
                         
                         # --- BLOQUE DE STREAMING OPTIMIZADO CON BÚSQUEDA WEB PARA REACTIVACIÓN ---
                         try:
-                            # ✅ VERIFICAR personalidad antes de responder
-                            debug_personality(conversation_history)
-                            
                             # ✅ USAR NUEVA FUNCIÓN OPTIMIZADA: una sola llamada GPT cuando es posible
                             text_generator = chat_with_tools_generator(
                                 history=conversation_history,
@@ -2316,9 +2234,6 @@ def main():
                     
                     # --- BLOQUE DE STREAMING OPTIMIZADO CON BÚSQUEDA WEB PARA CONVERSACIÓN ---
                     try:
-                        # ✅ VERIFICAR personalidad antes de cada respuesta
-                        debug_personality(conversation_history)
-                        
                         # ✅ USAR NUEVA FUNCIÓN OPTIMIZADA: ahorra llamadas cuando no hay búsqueda
                         text_generator = chat_with_tools_generator(
                             history=conversation_history,
