@@ -24,6 +24,16 @@ from google.cloud import speech
 import random
 import math
 
+# ✅ IMPORTACIONES PARA SISTEMA DE INTERRUPCIONES RESPEAKER v2.0
+import usb.core
+import usb.util
+import webrtcvad
+import collections
+import contextlib
+from scipy.signal import stft, butter, filtfilt
+from scipy.stats import entropy
+import librosa
+
 # ✅ THREAD-SAFETY
 history_lock = threading.Lock()
 import board
@@ -50,6 +60,44 @@ GPT5_MODEL = "gpt-5"          # modelo de conversación
 # Flag para pausar movimientos mecánicos mientras el micro escucha
 quiet_mode = False            # True = silencio de servos/orejas
 # ------------------------------------------------------------------
+
+# ✅ CONFIGURACIÓN ESPECÍFICA RESPEAKER MIC ARRAY v2.0 (SEE-14133)
+RESPEAKER_VID = 0x2886  # Seeed Technology
+RESPEAKER_PID = 0x0018  # ReSpeaker Mic Array v2.0
+RESPEAKER_CHANNELS = 6   # 4 mics + 2 playback channels
+RESPEAKER_RATE = 16000   # Óptimo para VAD y STT
+RESPEAKER_CHUNK = 480    # 30ms a 16kHz (óptimo para WebRTC VAD)
+
+# Geometría específica del ReSpeaker v2.0 (círculo de 4 micrófonos)
+MIC_POSITIONS = {
+    0: (0.0, 0.0325),      # Mic 0: Norte
+    1: (0.0325, 0.0),      # Mic 1: Este  
+    2: (0.0, -0.0325),     # Mic 2: Sur
+    3: (-0.0325, 0.0)      # Mic 3: Oeste
+}
+
+# Configuración VAD específica para ReSpeaker v2.0
+VAD_MODE = 3  # Más agresivo para mejor detección en ambiente ruidoso
+FRAME_DURATION_MS = 30  # Óptimo para WebRTC VAD
+PADDING_DURATION_MS = 300  # Confirmación de voz
+NUM_PADDING_FRAMES = int(PADDING_DURATION_MS / FRAME_DURATION_MS)
+
+# Variables globales para detección de voz avanzada
+vad = webrtcvad.Vad(VAD_MODE)
+ring_buffer = collections.deque(maxlen=NUM_PADDING_FRAMES)
+triggered = False
+voiced_frames = []
+interruption_detected = False
+audio_monitor_thread = None
+
+# Buffer para cancelación de eco específico del ReSpeaker
+echo_buffer = collections.deque(maxlen=2000)  # ~2 segundos de audio
+ECHO_SUPPRESSION_FACTOR = 0.4
+
+# Variables para sistema de interrupciones
+pending_response = ""  # Respuesta interrumpida para continuación
+VOICE_THRESHOLD = 0.3  # Umbral de confianza para confirmar voz
+CONSECUTIVE_REQUIRED = 3  # Frames consecutivos necesarios
 
 
 
@@ -792,6 +840,382 @@ def stop_quiet_glow():
         quiet_glow_thread.join(timeout=1)
     pixels.fill((0, 0, 0))
     pixels.show()
+
+# ✅ ========================================
+# SISTEMA DE INTERRUPCIONES RESPEAKER v2.0
+# =========================================
+
+def find_respeaker_v2():
+    """✅ Detectar específicamente ReSpeaker Mic Array v2.0"""
+    try:
+        device = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
+        if device:
+            print(f"✅ [RESPEAKER] ReSpeaker Mic Array v2.0 detectado: {device}")
+            return device
+        else:
+            print("❌ [RESPEAKER] ReSpeaker Mic Array v2.0 no encontrado")
+            return None
+    except Exception as e:
+        print(f"[RESPEAKER ERROR] {e}")
+        return None
+
+def configure_respeaker_v2():
+    """✅ Configurar ReSpeaker v2.0 con sus controles específicos"""
+    try:
+        print("🔧 [RESPEAKER] Configurando ReSpeaker Mic Array v2.0...")
+        
+        # Comandos específicos para ReSpeaker v2.0
+        device_commands = [
+            # Activar cancelación de eco automática
+            "amixer -D pulse sset 'Echo Cancellation' on 2>/dev/null || true",
+            
+            # Configurar supresión de ruido
+            "amixer -D pulse sset 'Noise Suppression' on 2>/dev/null || true",
+            
+            # Configurar ganancia automática  
+            "amixer -D pulse sset 'Auto Gain Control' on 2>/dev/null || true",
+            
+            # Configurar dirección del haz (frontal)
+            "amixer -D pulse sset 'Beam Forming' 'straight' 2>/dev/null || true",
+            
+            # Configurar ganancia de micrófono
+            "amixer -D pulse sset 'Mic' 80% 2>/dev/null || true",
+        ]
+        
+        for cmd in device_commands:
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                print(f"🔧 [RESPEAKER] Ejecutado: {cmd.split('sset')[1] if 'sset' in cmd else cmd}")
+            except Exception as e:
+                print(f"⚠️ [RESPEAKER] Error en comando: {e}")
+        
+        print("✅ [RESPEAKER] ReSpeaker v2.0 configurado")
+        return True
+        
+    except Exception as e:
+        print(f"[RESPEAKER ERROR] {e}")
+        return False
+
+def get_respeaker_v2_device_index():
+    """✅ Obtener índice específico del ReSpeaker v2.0 en PyAudio"""
+    try:
+        pa = pyaudio.PyAudio()
+        
+        for i in range(pa.get_device_count()):
+            device_info = pa.get_device_info_by_index(i)
+            device_name = device_info['name'].lower()
+            
+            # Nombres específicos que usa el ReSpeaker v2.0
+            if any(name in device_name for name in ['respeaker', 'seeed', 'mic array']):
+                if device_info['maxInputChannels'] >= 4:  # Verificar que tenga al menos 4 canales
+                    print(f"🎤 [RESPEAKER] ReSpeaker v2.0 encontrado en índice {i}")
+                    print(f"   - Nombre: {device_info['name']}")
+                    print(f"   - Canales de entrada: {device_info['maxInputChannels']}")
+                    print(f"   - Tasa de muestreo: {device_info['defaultSampleRate']}")
+                    pa.terminate()
+                    return i
+                    
+        pa.terminate()
+        print("❌ [RESPEAKER] ReSpeaker v2.0 no encontrado en PyAudio")
+        return None
+        
+    except Exception as e:
+        print(f"[RESPEAKER ERROR] {e}")
+        return None
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
+    """✅ Filtro pasabanda Butterworth"""
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data)
+
+def calculate_steering_vector(target_angle_deg, frequency, mic_positions):
+    """✅ Calcular vector de dirección para beamforming del ReSpeaker v2.0"""
+    target_angle_rad = np.radians(target_angle_deg)
+    sound_speed = 343.0  # m/s
+    wavelength = sound_speed / frequency
+    
+    steering_vector = []
+    reference_pos = mic_positions[0]  # Usar mic 0 como referencia
+    
+    for mic_id, pos in mic_positions.items():
+        # Calcular diferencia de posición relativa al micrófono de referencia
+        dx = pos[0] - reference_pos[0]
+        dy = pos[1] - reference_pos[1]
+        
+        # Calcular delay basado en ángulo objetivo
+        delay = (dx * np.cos(target_angle_rad) + dy * np.sin(target_angle_rad)) / sound_speed
+        
+        # Convertir delay a fase
+        phase = 2 * np.pi * frequency * delay
+        steering_vector.append(np.exp(-1j * phase))
+    
+    return np.array(steering_vector)
+
+def advanced_beamforming(multichannel_audio, target_angle=0, sample_rate=16000):
+    """✅ Beamforming avanzado específico para geometría circular del ReSpeaker v2.0"""
+    if multichannel_audio.shape[1] < 4:
+        return multichannel_audio[:, 0]
+    
+    try:
+        # Usar solo los 4 micrófonos (excluir canales de playback)
+        mic_audio = multichannel_audio[:, :4]
+        
+        # Aplicar ventana para reducir artefactos
+        window_size = 512
+        hop_size = 256
+        
+        # Procesar en bloques con solapamiento
+        output_length = mic_audio.shape[0]
+        beamformed_output = np.zeros(output_length)
+        
+        for start in range(0, output_length - window_size, hop_size):
+            end = start + window_size
+            audio_block = mic_audio[start:end]
+            
+            # FFT de cada canal
+            fft_channels = [np.fft.fft(audio_block[:, ch]) for ch in range(4)]
+            frequencies = np.fft.fftfreq(window_size, 1/sample_rate)
+            
+            # Aplicar beamforming en dominio de frecuencia
+            beamformed_fft = np.zeros_like(fft_channels[0])
+            
+            for freq_idx, freq in enumerate(frequencies[:window_size//2]):
+                if freq < 100:  # Filtrar frecuencias muy bajas
+                    continue
+                    
+                # Calcular vector de dirección para esta frecuencia
+                steering_vec = calculate_steering_vector(target_angle, abs(freq), MIC_POSITIONS)
+                
+                # Combinar señales de todos los micrófonos
+                freq_data = np.array([ch[freq_idx] for ch in fft_channels])
+                beamformed_fft[freq_idx] = np.dot(steering_vec.conj(), freq_data)
+            
+            # Simetría hermítica para IFFT real
+            beamformed_fft[window_size//2:] = np.conj(beamformed_fft[1:window_size//2+1][::-1])
+            
+            # IFFT y ventana de solapamiento
+            time_signal = np.real(np.fft.ifft(beamformed_fft))
+            
+            # Aplicar ventana de Hann para solapamiento suave
+            window = np.hann(window_size)
+            time_signal *= window
+            
+            # Sumar al output con solapamiento
+            beamformed_output[start:end] += time_signal
+        
+        return beamformed_output
+        
+    except Exception as e:
+        print(f"[BEAMFORMING ERROR] {e}")
+        return multichannel_audio[:, 0]  # Fallback al primer canal
+
+def adaptive_echo_cancellation(input_signal, reference_signal, filter_length=512):
+    """✅ Cancelación de eco adaptativa usando algoritmo LMS"""
+    if len(reference_signal) == 0 or len(input_signal) != len(reference_signal):
+        return input_signal
+    
+    try:
+        # Parámetros del filtro adaptativo LMS
+        mu = 0.01  # Factor de aprendizaje
+        w = np.zeros(filter_length)  # Coeficientes del filtro
+        
+        output_signal = np.zeros_like(input_signal)
+        
+        for n in range(filter_length, len(input_signal)):
+            # Vector de entrada (señal de referencia retardada)
+            x = reference_signal[n-filter_length:n][::-1]
+            
+            # Señal de eco estimada
+            y = np.dot(w, x)
+            
+            # Error (señal limpia estimada)
+            e = input_signal[n] - y
+            output_signal[n] = e
+            
+            # Actualización de coeficientes LMS
+            w += mu * e * x
+        
+        return output_signal
+        
+    except Exception as e:
+        print(f"[ECHO CANCEL ERROR] {e}")
+        return input_signal
+
+def respeaker_v2_voice_detection(multichannel_audio):
+    """✅ Detección de voz específica para ReSpeaker v2.0 con todas sus capacidades"""
+    try:
+        # 1. Beamforming dirigido hacia la fuente de voz (frontal por defecto)
+        beamformed_audio = advanced_beamforming(multichannel_audio, target_angle=0)
+        
+        # 2. Cancelación de eco adaptativa si hay audio de reproducción
+        if len(echo_buffer) > 0:
+            reference_audio = np.array(list(echo_buffer)[-len(beamformed_audio):])
+            if len(reference_audio) == len(beamformed_audio):
+                beamformed_audio = adaptive_echo_cancellation(beamformed_audio, reference_audio)
+        
+        # 3. Filtro pasabanda para frecuencias de voz humana
+        filtered_audio = butter_bandpass_filter(beamformed_audio, 300, 3400, RESPEAKER_RATE)
+        
+        # 4. Detección VAD usando WebRTC
+        audio_int16 = (filtered_audio * 32767).astype(np.int16)
+        
+        # Procesar en chunks correctos para WebRTC VAD
+        voice_detected = False
+        confidence_scores = []
+        
+        chunk_size = int(RESPEAKER_RATE * FRAME_DURATION_MS / 1000.0)
+        
+        for i in range(0, len(audio_int16) - chunk_size, chunk_size):
+            chunk = audio_int16[i:i + chunk_size]
+            if len(chunk) == chunk_size:
+                is_speech = vad.is_speech(chunk.tobytes(), RESPEAKER_RATE)
+                if is_speech:
+                    voice_detected = True
+                    # Calcular confianza basada en energía y características espectrales
+                    energy = np.sum(chunk.astype(np.float32)**2)
+                    confidence_scores.append(energy)
+        
+        # Calcular confianza promedio
+        voice_confidence = np.mean(confidence_scores) if confidence_scores else 0.0
+        voice_confidence = min(1.0, voice_confidence / 1e8)  # Normalizar
+        
+        return voice_detected, filtered_audio, voice_confidence
+        
+    except Exception as e:
+        print(f"[VOICE DETECTION ERROR] {e}")
+        return False, multichannel_audio[:, 0] if multichannel_audio.ndim > 1 else multichannel_audio, 0.0
+
+def respeaker_v2_interruption_monitor():
+    """✅ Monitor de interrupciones específico para ReSpeaker Mic Array v2.0"""
+    global interruption_detected, echo_buffer
+    
+    respeaker_index = get_respeaker_v2_device_index()
+    if respeaker_index is None:
+        print("❌ [INTERRUPTION] ReSpeaker v2.0 no encontrado, usando micrófono por defecto")
+        return
+    
+    try:
+        pa = pyaudio.PyAudio()
+        
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=RESPEAKER_CHANNELS,
+            rate=RESPEAKER_RATE,
+            input=True,
+            input_device_index=respeaker_index,
+            frames_per_buffer=RESPEAKER_CHUNK
+        )
+        
+        consecutive_voice_frames = 0
+        silence_frames = 0
+        
+        print(f"🎤 [INTERRUPTION] Monitor ReSpeaker v2.0 activado")
+        print(f"   - Dispositivo: {respeaker_index}")
+        print(f"   - Beamforming adaptativo: ✅")
+        print(f"   - Cancelación de eco: ✅")
+        print(f"   - VAD WebRTC: Modo {VAD_MODE}")
+        
+        while is_speaking and not interruption_detected and not system_shutdown:
+            try:
+                # Capturar audio multicanal
+                audio_data = stream.read(RESPEAKER_CHUNK, exception_on_overflow=False)
+                
+                # Convertir a array numpy multicanal
+                audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                multichannel_audio = audio_array.reshape(-1, RESPEAKER_CHANNELS)
+                
+                # Convertir a float32 normalizado
+                multichannel_float = multichannel_audio.astype(np.float32) / 32768.0
+                
+                # ✅ DETECCIÓN AVANZADA CON TODAS LAS CAPACIDADES DEL RESPEAKER v2.0
+                voice_detected, processed_audio, confidence = respeaker_v2_voice_detection(multichannel_float)
+                
+                if voice_detected and confidence >= VOICE_THRESHOLD:
+                    consecutive_voice_frames += 1
+                    silence_frames = 0
+                    
+                    if consecutive_voice_frames >= CONSECUTIVE_REQUIRED:
+                        print(f"\n🛑 [INTERRUPTION] ReSpeaker v2.0 detectó voz humana!")
+                        print(f"   - Confianza: {confidence:.3f}")
+                        print(f"   - Beamforming activo: ✅")
+                        interruption_detected = True
+                        break
+                else:
+                    consecutive_voice_frames = max(0, consecutive_voice_frames - 1)
+                    silence_frames += 1
+                
+                # Reset automático con mucho silencio
+                if silence_frames > 40:  # ~1.2 segundos de silencio
+                    consecutive_voice_frames = 0
+                    
+            except Exception as e:
+                if "Input overflowed" not in str(e):
+                    print(f"[INTERRUPTION ERROR] {e}")
+                time.sleep(0.01)
+                
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+        
+    except Exception as e:
+        print(f"[RESPEAKER v2.0 INTERRUPTION ERROR] {e}")
+
+def start_respeaker_v2_interruption_monitor():
+    """✅ Iniciar monitor específico para ReSpeaker v2.0"""
+    global audio_monitor_thread, interruption_detected
+    
+    interruption_detected = False
+    ring_buffer.clear()
+    voiced_frames.clear()
+    
+    audio_monitor_thread = threading.Thread(target=respeaker_v2_interruption_monitor, daemon=True)
+    audio_monitor_thread.start()
+
+def stop_respeaker_v2_interruption_monitor():
+    """✅ Detener monitor específico para ReSpeaker v2.0"""
+    global audio_monitor_thread
+    if audio_monitor_thread and audio_monitor_thread.is_alive():
+        audio_monitor_thread.join(timeout=1)
+    audio_monitor_thread = None
+
+def add_echo_to_buffer(audio_chunk):
+    """✅ Añadir audio reproducido al buffer para cancelación de eco"""
+    global echo_buffer
+    
+    if isinstance(audio_chunk, bytes):
+        samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+        echo_buffer.extend(samples)
+
+def initialize_respeaker_v2_system():
+    """✅ Inicializar sistema completo ReSpeaker Mic Array v2.0"""
+    print("🎤 [RESPEAKER v2.0] Inicializando sistema...")
+    
+    # 1. Detectar dispositivo específico
+    device = find_respeaker_v2()
+    if not device:
+        print("⚠️ [RESPEAKER v2.0] Usando micrófono por defecto")
+        return False
+    
+    # 2. Configurar parámetros específicos del v2.0
+    if not configure_respeaker_v2():
+        print("⚠️ [RESPEAKER v2.0] Configuración parcial")
+    
+    # 3. Verificar disponibilidad en PyAudio
+    respeaker_index = get_respeaker_v2_device_index()
+    if respeaker_index is None:
+        print("❌ [RESPEAKER v2.0] No disponible en PyAudio")
+        return False
+    
+    print("✅ [RESPEAKER v2.0] Sistema inicializado correctamente")
+    print("🎯 [FEATURES] Beamforming circular + Cancelación de eco adaptativa")
+    return True
+
+# ✅ ========================================
+# FIN SISTEMA INTERRUPCIONES RESPEAKER v2.0
+# =========================================
 
 
 

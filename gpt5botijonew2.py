@@ -24,6 +24,16 @@ from google.cloud import speech
 import random
 import math
 
+# ✅ IMPORTACIONES PARA SISTEMA DE INTERRUPCIONES RESPEAKER v2.0
+import usb.core
+import usb.util
+import webrtcvad
+import collections
+import contextlib
+from scipy.signal import stft, butter, filtfilt
+from scipy.stats import entropy
+import librosa
+
 # ✅ THREAD-SAFETY
 history_lock = threading.Lock()
 import board
@@ -50,6 +60,47 @@ GPT5_MODEL = "gpt-5"          # modelo de conversación
 # Flag para pausar movimientos mecánicos mientras el micro escucha
 quiet_mode = False            # True = silencio de servos/orejas
 # ------------------------------------------------------------------
+
+# ✅ CONFIGURACIÓN ESPECÍFICA RESPEAKER MIC ARRAY v2.0 (SEE-14133)
+RESPEAKER_VID = 0x2886  # Seeed Technology
+RESPEAKER_PID = 0x0018  # ReSpeaker Mic Array v2.0
+RESPEAKER_CHANNELS = 1   # ✅ PyAudio ve el agregado de 4 mics como 1 canal
+RESPEAKER_RATE = 16000   # Óptimo para VAD y STT
+RESPEAKER_CHUNK = 480    # 30ms a 16kHz (óptimo para WebRTC VAD)
+
+# Geometría específica del ReSpeaker v2.0 (círculo de 4 micrófonos)
+MIC_POSITIONS = {
+    0: (0.0, 0.0325),      # Mic 0: Norte
+    1: (0.0325, 0.0),      # Mic 1: Este  
+    2: (0.0, -0.0325),     # Mic 2: Sur
+    3: (-0.0325, 0.0)      # Mic 3: Oeste
+}
+
+# Configuración VAD específica para ReSpeaker v2.0
+VAD_MODE = 3  # Más agresivo para mejor detección en ambiente ruidoso
+FRAME_DURATION_MS = 30  # Óptimo para WebRTC VAD
+PADDING_DURATION_MS = 300  # Confirmación de voz
+NUM_PADDING_FRAMES = int(PADDING_DURATION_MS / FRAME_DURATION_MS)
+
+# Variables globales para detección de voz avanzada
+vad = webrtcvad.Vad(VAD_MODE)
+ring_buffer = collections.deque(maxlen=NUM_PADDING_FRAMES)
+triggered = False
+voiced_frames = []
+interruption_detected = False
+audio_monitor_thread = None
+
+# Buffer para cancelación de eco específico del ReSpeaker
+echo_buffer = collections.deque(maxlen=2000)  # ~2 segundos de audio
+ECHO_SUPPRESSION_FACTOR = 0.4
+
+# Variables para sistema de interrupciones
+pending_response = ""  # Respuesta interrumpida para continuación
+VOICE_THRESHOLD = 0.3  # Umbral de confianza para confirmar voz
+CONSECUTIVE_REQUIRED = 3  # Frames consecutivos necesarios
+
+# Variables globales de estado
+is_speaking = False  # Estado global de TTS
 
 
 
@@ -792,6 +843,733 @@ def stop_quiet_glow():
         quiet_glow_thread.join(timeout=1)
     pixels.fill((0, 0, 0))
     pixels.show()
+
+# ✅ ========================================
+# SISTEMA DE INTERRUPCIONES RESPEAKER v2.0
+# =========================================
+
+def find_respeaker_v2():
+    """✅ Detectar específicamente ReSpeaker Mic Array v2.0"""
+    try:
+        device = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
+        if device:
+            print(f"✅ [RESPEAKER] ReSpeaker Mic Array v2.0 detectado: {device}")
+            return device
+        else:
+            print("❌ [RESPEAKER] ReSpeaker Mic Array v2.0 no encontrado")
+            return None
+    except Exception as e:
+        print(f"[RESPEAKER ERROR] {e}")
+        return None
+
+def configure_respeaker_v2():
+    """🔧 Configurar ReSpeaker Mic Array v2.0 para óptima detección de voz"""
+    try:
+        print("🔧 [RESPEAKER] Configurando ReSpeaker Mic Array v2.0...")
+        
+        # Configuraciones básicas de hardware  
+        device_commands = [
+            # Activar cancelación de eco automática
+            "amixer -D pulse sset 'Echo Cancellation' on 2>/dev/null || true",
+            
+            # Configurar supresión de ruido
+            "amixer -D pulse sset 'Noise Suppression' on 2>/dev/null || true",
+            
+            # Configurar ganancia automática  
+            "amixer -D pulse sset 'Auto Gain Control' on 2>/dev/null || true",
+            
+            # Configurar dirección del haz (frontal)
+            "amixer -D pulse sset 'Beam Forming' 'straight' 2>/dev/null || true",
+            
+            # Configurar ganancia de micrófono
+            "amixer -D pulse sset 'Mic' 80% 2>/dev/null || true",
+        ]
+        
+        for cmd in device_commands:
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                print(f"🔧 [RESPEAKER] Ejecutado: {cmd.split('sset')[1] if 'sset' in cmd else cmd}")
+            except Exception as e:
+                print(f"⚠️ [RESPEAKER] Error en comando: {e}")
+        
+        print("✅ [RESPEAKER] ReSpeaker v2.0 configurado")
+        
+        # ✅ CONFIGURAR VAD NATIVO DEL HARDWARE
+        try:
+            import sys
+            sys.path.insert(0, './usb_4_mic_array')
+            from tuning import Tuning
+            import usb.core
+            
+            dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
+            if dev:
+                tuning = Tuning(dev)
+                
+                # Configurar parámetros de VAD para mayor sensibilidad a interrupciones
+                print("🎯 [HARDWARE VAD] Configurando detección nativa...")
+                
+                # Ajustar umbral de VAD para mayor sensibilidad (valor más bajo = más sensible)
+                tuning.write('GAMMAVAD_SR', 2.0)  # Umbral VAD para ASR (default: 3.5)
+                
+                # Verificar valores actuales
+                vad_threshold = tuning.read('GAMMAVAD_SR')
+                agc_status = tuning.read('AGCONOFF')
+                
+                print(f"   - Umbral VAD configurado: {vad_threshold}")
+                print(f"   - AGC habilitado: {agc_status}")
+                print("✅ [HARDWARE VAD] Configuración aplicada")
+                
+        except Exception as e:
+            print(f"⚠️ [HARDWARE VAD] No se pudo configurar VAD nativo: {e}")
+            print("   Usando configuración por defecto")
+        
+        return True
+        
+    except Exception as e:
+        print(f"[RESPEAKER ERROR] {e}")
+        return False
+
+def get_respeaker_v2_device_index():
+    """✅ Obtener índice específico del ReSpeaker v2.0 en PyAudio"""
+    try:
+        pa = pyaudio.PyAudio()
+        
+        for i in range(pa.get_device_count()):
+            device_info = pa.get_device_info_by_index(i)
+            device_name = device_info['name'].lower()
+            
+            # Buscar específicamente por el nombre exacto encontrado en el debug
+            if ('respeaker 4 mic array' in device_name and 'uac1.0' in device_name) or \
+               any(name in device_name for name in ['respeaker', 'seeed', 'mic array', 'arrayuac']):
+                if device_info['maxInputChannels'] > 0:  # Solo verificar que tenga canales de entrada
+                    print(f"🎤 [RESPEAKER] ReSpeaker v2.0 encontrado en índice {i}")
+                    print(f"   - Nombre: {device_info['name']}")
+                    print(f"   - Canales de entrada: {device_info['maxInputChannels']}")
+                    print(f"   - Tasa de muestreo: {device_info['defaultSampleRate']}")
+                    pa.terminate()
+                    return i
+                    
+        pa.terminate()
+        print("❌ [RESPEAKER] ReSpeaker v2.0 no encontrado en PyAudio")
+        return None
+        
+    except Exception as e:
+        print(f"[RESPEAKER ERROR] {e}")
+        return None
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
+    """✅ Filtro pasabanda Butterworth"""
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data)
+
+def calculate_steering_vector(target_angle_deg, frequency, mic_positions):
+    """✅ Calcular vector de dirección para beamforming del ReSpeaker v2.0"""
+    target_angle_rad = np.radians(target_angle_deg)
+    sound_speed = 343.0  # m/s
+    wavelength = sound_speed / frequency
+    
+    steering_vector = []
+    reference_pos = mic_positions[0]  # Usar mic 0 como referencia
+    
+    for mic_id, pos in mic_positions.items():
+        # Calcular diferencia de posición relativa al micrófono de referencia
+        dx = pos[0] - reference_pos[0]
+        dy = pos[1] - reference_pos[1]
+        
+        # Calcular delay basado en ángulo objetivo
+        delay = (dx * np.cos(target_angle_rad) + dy * np.sin(target_angle_rad)) / sound_speed
+        
+        # Convertir delay a fase
+        phase = 2 * np.pi * frequency * delay
+        steering_vector.append(np.exp(-1j * phase))
+    
+    return np.array(steering_vector)
+
+def advanced_beamforming(multichannel_audio, target_angle=0, sample_rate=16000):
+    """✅ Beamforming avanzado específico para geometría circular del ReSpeaker v2.0"""
+    if multichannel_audio.shape[1] < 4:
+        return multichannel_audio[:, 0]
+    
+    try:
+        # Usar solo los 4 micrófonos (excluir canales de playback)
+        mic_audio = multichannel_audio[:, :4]
+        
+        # Aplicar ventana para reducir artefactos
+        window_size = 512
+        hop_size = 256
+        
+        # Procesar en bloques con solapamiento
+        output_length = mic_audio.shape[0]
+        beamformed_output = np.zeros(output_length)
+        
+        for start in range(0, output_length - window_size, hop_size):
+            end = start + window_size
+            audio_block = mic_audio[start:end]
+            
+            # FFT de cada canal
+            fft_channels = [np.fft.fft(audio_block[:, ch]) for ch in range(4)]
+            frequencies = np.fft.fftfreq(window_size, 1/sample_rate)
+            
+            # Aplicar beamforming en dominio de frecuencia
+            beamformed_fft = np.zeros_like(fft_channels[0])
+            
+            for freq_idx, freq in enumerate(frequencies[:window_size//2]):
+                if freq < 100:  # Filtrar frecuencias muy bajas
+                    continue
+                    
+                # Calcular vector de dirección para esta frecuencia
+                steering_vec = calculate_steering_vector(target_angle, abs(freq), MIC_POSITIONS)
+                
+                # Combinar señales de todos los micrófonos
+                freq_data = np.array([ch[freq_idx] for ch in fft_channels])
+                beamformed_fft[freq_idx] = np.dot(steering_vec.conj(), freq_data)
+            
+            # Simetría hermítica para IFFT real
+            beamformed_fft[window_size//2:] = np.conj(beamformed_fft[1:window_size//2+1][::-1])
+            
+            # IFFT y ventana de solapamiento
+            time_signal = np.real(np.fft.ifft(beamformed_fft))
+            
+            # Aplicar ventana de Hann para solapamiento suave
+            window = np.hann(window_size)
+            time_signal *= window
+            
+            # Sumar al output con solapamiento
+            beamformed_output[start:end] += time_signal
+        
+        return beamformed_output
+        
+    except Exception as e:
+        print(f"[BEAMFORMING ERROR] {e}")
+        return multichannel_audio[:, 0]  # Fallback al primer canal
+
+def adaptive_echo_cancellation(input_signal, reference_signal, filter_length=512):
+    """✅ Cancelación de eco adaptativa usando algoritmo LMS"""
+    if len(reference_signal) == 0 or len(input_signal) != len(reference_signal):
+        return input_signal
+    
+    try:
+        # Parámetros del filtro adaptativo LMS
+        mu = 0.01  # Factor de aprendizaje
+        w = np.zeros(filter_length)  # Coeficientes del filtro
+        
+        output_signal = np.zeros_like(input_signal)
+        
+        for n in range(filter_length, len(input_signal)):
+            # Vector de entrada (señal de referencia retardada)
+            x = reference_signal[n-filter_length:n][::-1]
+            
+            # Señal de eco estimada
+            y = np.dot(w, x)
+            
+            # Error (señal limpia estimada)
+            e = input_signal[n] - y
+            output_signal[n] = e
+            
+            # Actualización de coeficientes LMS
+            w += mu * e * x
+        
+        return output_signal
+        
+    except Exception as e:
+        print(f"[ECHO CANCEL ERROR] {e}")
+        return input_signal
+
+def respeaker_v2_voice_detection_mono(audio_float):
+    """✅ Detección de voz simplificada y más robusta para canal mono del ReSpeaker v2.0"""
+    try:
+        # ✅ VALIDACIÓN BÁSICA
+        if len(audio_float) < 480:  # Necesitamos al menos 480 samples (30ms a 16kHz)
+            return False, 0.0
+        
+        # ✅ CONVERSIÓN DIRECTA A INT16 PARA WEBRTC VAD
+        # Asegurar que está en el rango correcto
+        audio_float_clipped = np.clip(audio_float, -1.0, 1.0)
+        audio_int16 = (audio_float_clipped * 32767).astype(np.int16)
+        
+        # ✅ DETECCIÓN VAD SIMPLIFICADA - usar todo el frame
+        chunk_size = 480  # 30ms a 16kHz (requerido por WebRTC VAD)
+        
+        # Tomar el primer chunk completo disponible
+        if len(audio_int16) >= chunk_size:
+            chunk = audio_int16[:chunk_size]
+            
+            try:
+                # ✅ WEBRTC VAD DIRECTO
+                is_speech = vad.is_speech(chunk.tobytes(), RESPEAKER_RATE)
+                
+                if is_speech:
+                    # ✅ CALCULAR CONFIANZA BASADA EN ENERGÍA RMS
+                    rms_energy = np.sqrt(np.mean(chunk.astype(np.float32)**2))
+                    
+                    # Normalizar energía (valores típicos de voz: 1000-10000)
+                    confidence = min(1.0, rms_energy / 5000.0)
+                    confidence = max(0.1, confidence)  # Mínimo 0.1 si VAD detecta voz
+                    
+                    return True, confidence
+                else:
+                    # ✅ FALLBACK: Detectar actividad por energía si VAD falla
+                    rms_energy = np.sqrt(np.mean(chunk.astype(np.float32)**2))
+                    
+                    # Umbral de energía para detectar sonido (ajustado para ReSpeaker)
+                    energy_threshold = 500.0
+                    
+                    if rms_energy > energy_threshold:
+                        confidence = min(1.0, rms_energy / 3000.0)
+                        return True, confidence
+                    
+                    return False, 0.0
+            
+            except Exception as vad_error:
+                print(f"[VAD ERROR] {vad_error} - usando detección por energía")
+                # ✅ FALLBACK TOTAL: Solo energía RMS
+                rms_energy = np.sqrt(np.mean(chunk.astype(np.float32)**2))
+                energy_threshold = 800.0
+                
+                if rms_energy > energy_threshold:
+                    confidence = min(1.0, rms_energy / 4000.0)
+                    return True, confidence
+                
+                return False, 0.0
+        
+        return False, 0.0
+        
+    except Exception as e:
+        print(f"[VOICE DETECTION MONO ERROR] {e}")
+        return False, 0.0
+
+def respeaker_v2_voice_detection(multichannel_audio):
+    """✅ Detección de voz específica para ReSpeaker v2.0 con todas sus capacidades"""
+    try:
+        # 1. Beamforming dirigido hacia la fuente de voz (frontal por defecto)
+        beamformed_audio = advanced_beamforming(multichannel_audio, target_angle=0)
+        
+        # 2. Cancelación de eco adaptativa si hay audio de reproducción
+        if len(echo_buffer) > 0:
+            reference_audio = np.array(list(echo_buffer)[-len(beamformed_audio):])
+            if len(reference_audio) == len(beamformed_audio):
+                beamformed_audio = adaptive_echo_cancellation(beamformed_audio, reference_audio)
+        
+        # 3. Filtro pasabanda para frecuencias de voz humana
+        filtered_audio = butter_bandpass_filter(beamformed_audio, 300, 3400, RESPEAKER_RATE)
+        
+        # 4. Detección VAD usando WebRTC
+        audio_int16 = (filtered_audio * 32767).astype(np.int16)
+        
+        # Procesar en chunks correctos para WebRTC VAD
+        voice_detected = False
+        confidence_scores = []
+        
+        chunk_size = int(RESPEAKER_RATE * FRAME_DURATION_MS / 1000.0)
+        
+        for i in range(0, len(audio_int16) - chunk_size, chunk_size):
+            chunk = audio_int16[i:i + chunk_size]
+            if len(chunk) == chunk_size:
+                is_speech = vad.is_speech(chunk.tobytes(), RESPEAKER_RATE)
+                if is_speech:
+                    voice_detected = True
+                    # Calcular confianza basada en energía y características espectrales
+                    energy = np.sum(chunk.astype(np.float32)**2)
+                    confidence_scores.append(energy)
+        
+        # Calcular confianza promedio
+        voice_confidence = np.mean(confidence_scores) if confidence_scores else 0.0
+        voice_confidence = min(1.0, voice_confidence / 1e8)  # Normalizar
+        
+        return voice_detected, filtered_audio, voice_confidence
+        
+    except Exception as e:
+        print(f"[VOICE DETECTION ERROR] {e}")
+        return False, multichannel_audio[:, 0] if multichannel_audio.ndim > 1 else multichannel_audio, 0.0
+
+def respeaker_v2_interruption_monitor():
+    """✅ Monitor de interrupciones usando detección NATIVA del ReSpeaker v2.0"""
+    global interruption_detected, echo_buffer
+    
+    respeaker_index = get_respeaker_v2_device_index()
+    if respeaker_index is None:
+        print("❌ [INTERRUPTION] ReSpeaker v2.0 no encontrado, usando micrófono por defecto")
+        return
+    
+    # ✅ USAR DETECCIÓN NATIVA DEL RESPEAKER v2.0
+    respeaker_tuning = None
+    try:
+        import sys
+        sys.path.insert(0, './usb_4_mic_array')
+        from tuning import Tuning
+        import usb.core
+        
+        # Encontrar dispositivo USB del ReSpeaker v2.0
+        dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
+        if dev:
+            respeaker_tuning = Tuning(dev)
+            print("🎯 [HARDWARE VAD] Usando detección NATIVA del ReSpeaker v2.0")
+        else:
+            print("⚠️ [HARDWARE VAD] No se pudo conectar al tuning del ReSpeaker, usando WebRTC VAD")
+    except Exception as e:
+        print(f"⚠️ [HARDWARE VAD] Error al inicializar tuning: {e}")
+        print("🔄 [FALLBACK] Usando WebRTC VAD como respaldo")
+    
+    try:
+        pa = pyaudio.PyAudio()
+        
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=RESPEAKER_CHANNELS,
+            rate=RESPEAKER_RATE,
+            input=True,
+            input_device_index=respeaker_index,
+            frames_per_buffer=RESPEAKER_CHUNK
+        )
+        
+        consecutive_voice_frames = 0
+        silence_frames = 0
+        initial_silence_period = 20  # Esperar ~0.6 segundos antes de empezar a detectar
+        playback_silence_period = 0  # Contador para silencio después de reproducción
+        
+        print(f"🎤 [INTERRUPTION] Monitor ReSpeaker v2.0 activado")
+        print(f"   - Dispositivo: {respeaker_index}")
+        print(f"   - Hardware beamforming: ✅")
+        print(f"   - Cancelación de eco: ✅")
+        if respeaker_tuning:
+            print(f"   - VAD Nativo: ✅ (SPEECHDETECTED + VOICEACTIVITY)")
+        else:
+            print(f"   - VAD WebRTC: Modo {VAD_MODE}")
+        print(f"   - Umbral de confianza: {VOICE_THRESHOLD}")
+        print(f"   - Frames consecutivos requeridos: {CONSECUTIVE_REQUIRED}")
+        print(f"🎯 [DEBUG] Iniciando bucle de detección...")
+        
+        while is_speaking and not interruption_detected and not system_shutdown:
+            try:
+                # ✅ PERÍODO INICIAL DE SILENCIO para evitar auto-detección
+                if initial_silence_period > 0:
+                    initial_silence_period -= 1
+                    audio_data = stream.read(RESPEAKER_CHUNK, exception_on_overflow=False)
+                    time.sleep(0.01)
+                    continue
+                
+                # Capturar audio del canal agregado (beamforming ya aplicado por hardware)
+                audio_data = stream.read(RESPEAKER_CHUNK, exception_on_overflow=False)
+                
+                voice_detected = False
+                confidence = 0.0
+                
+                # ✅ USAR DETECCIÓN NATIVA DEL RESPEAKER SI ESTÁ DISPONIBLE
+                if respeaker_tuning:
+                    try:
+                        speech_detected = respeaker_tuning.read('SPEECHDETECTED')
+                        voice_activity = respeaker_tuning.read('VOICEACTIVITY')
+                        
+                        # ✅ FILTRO ADICIONAL: Solo considerar "real" si ambos están activos
+                        # Esto reduce falsos positivos del eco
+                        voice_detected = bool(speech_detected and voice_activity)
+                        confidence = 1.0 if voice_detected else 0.0
+                        
+                        # ✅ DEBUG CADA 20 FRAMES (~0.6 segundos)
+                        if consecutive_voice_frames % 20 == 0:
+                            print(f"🎤 [HARDWARE VAD] Speech: {speech_detected}, Voice: {voice_activity}, Combined: {voice_detected}")
+                        
+                    except Exception as e:
+                        # Fallback a WebRTC VAD si falla el hardware
+                        print(f"⚠️ [HARDWARE VAD] Error: {e}, usando WebRTC VAD")
+                        respeaker_tuning = None
+                
+                # ✅ FALLBACK A WEBRTC VAD SI NO HAY DETECCIÓN NATIVA
+                if not respeaker_tuning:
+                    # Convertir a array numpy mono
+                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    audio_float = audio_array.astype(np.float32) / 32768.0
+                    
+                    voice_detected, confidence = respeaker_v2_voice_detection_mono(audio_float)
+                    
+                    # ✅ DEBUG CADA 20 FRAMES (~0.6 segundos)
+                    if consecutive_voice_frames % 20 == 0:
+                        print(f"🎤 [WEBRTC VAD] Voice: {voice_detected}, Conf: {confidence:.3f}, Consec: {consecutive_voice_frames}")
+                
+                # ✅ FILTRO ADICIONAL: Requerir más frames consecutivos para confirmar
+                if voice_detected and confidence >= VOICE_THRESHOLD:
+                    consecutive_voice_frames += 1
+                    silence_frames = 0
+                    
+                    print(f"🎤 [DETECTION] Voz detectada! Confianza: {confidence:.3f}, Consecutivos: {consecutive_voice_frames}/{CONSECUTIVE_REQUIRED}")
+                    
+                    # ✅ AUMENTAR REQUISITO para evitar falsos positivos
+                    required_frames = CONSECUTIVE_REQUIRED * 2  # Doble de frames requeridos
+                    
+                    if consecutive_voice_frames >= required_frames:
+                        detection_method = "Hardware VAD" if respeaker_tuning else "WebRTC VAD"
+                        print(f"\n🛑 [INTERRUPTION] ¡ReSpeaker v2.0 detectó voz humana! ({detection_method})")
+                        print(f"   - Confianza: {confidence:.3f}")
+                        print(f"   - Hardware beamforming: ✅")
+                        print(f"   - Frames consecutivos: {consecutive_voice_frames}")
+                        interruption_detected = True
+                        break
+                else:
+                    consecutive_voice_frames = max(0, consecutive_voice_frames - 2)  # Decrementar más rápido
+                    silence_frames += 1
+                
+                # Reset automático con mucho silencio
+                if silence_frames > 40:  # ~1.2 segundos de silencio
+                    consecutive_voice_frames = 0
+                    
+            except Exception as e:
+                if "Input overflowed" not in str(e):
+                    print(f"[INTERRUPTION ERROR] {e}")
+                time.sleep(0.01)
+                
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+        
+    except Exception as e:
+        print(f"[RESPEAKER v2.0 INTERRUPTION ERROR] {e}")
+
+def start_respeaker_v2_interruption_monitor():
+    """✅ Iniciar monitor específico para ReSpeaker v2.0 - Versión no conflictiva"""
+    global audio_monitor_thread, interruption_detected
+    
+    interruption_detected = False
+    ring_buffer.clear()
+    voiced_frames.clear()
+    
+    # ✅ VERIFICAR si ya hay un thread activo para evitar conflictos
+    if audio_monitor_thread and audio_monitor_thread.is_alive():
+        print("🎤 [MONITOR] Monitor de interrupciones ya activo")
+        return
+    
+    audio_monitor_thread = threading.Thread(target=respeaker_v2_interruption_monitor_lightweight, daemon=True)
+    audio_monitor_thread.start()
+
+def quick_stt_verification() -> bool:
+    """
+    ✅ STT rápido para verificar si hay palabras reales, no solo ruidos
+    Retorna True si detecta palabras, False si solo ruidos/silencio
+    """
+    if not speech_client:
+        return False
+        
+    try:
+        # Configuración para STT ultra-rápido pero más sensible
+        recognition_config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=STT_RATE,
+            language_code="es-ES",
+            enable_automatic_punctuation=False,
+            use_enhanced=True,  # Volver a enhanced para mejor reconocimiento
+            model="latest_short"  # Modelo optimizado para audio corto
+        )
+        
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=recognition_config,
+            interim_results=True,  # Habilitar resultados intermedios para detección más rápida
+            single_utterance=True
+        )
+        
+        # Captura un poco más larga para dar tiempo al reconocimiento
+        start_time = time.time()
+        max_capture_time = 2.5  # 2.5 segundos para verificar palabras reales
+        
+        with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
+            audio_generator = stream.generator()
+            
+            def quick_request_generator():
+                chunk_count = 0
+                for content in audio_generator:
+                    # Timeout muy corto para verificación rápida
+                    if time.time() - start_time > max_capture_time:
+                        break
+                    # ✅ REMOVIDO: No cancelar si Botijo está hablando - necesitamos detectar interrupciones
+                    # if not is_speaking:  # Si Botijo dejó de hablar, cancelar
+                    #     break
+                    chunk_count += 1
+                    if chunk_count > 15:  # Máximo 15 chunks (~1.5 segundos de audio)
+                        break
+                    yield speech.StreamingRecognizeRequest(audio_content=content)
+            
+            responses = speech_client.streaming_recognize(
+                config=streaming_config,
+                requests=quick_request_generator()
+            )
+            
+            # Verificación con timeout ultra-corto
+            import threading
+            import queue
+            
+            result_queue = queue.Queue()
+            
+            def quick_process():
+                try:
+                    for response in responses:
+                        if response.results and response.results[0].alternatives:
+                            transcript = response.results[0].alternatives[0].transcript.strip()
+                            if transcript and len(transcript) > 1:  # Al menos 2 caracteres (menos estricto)
+                                result_queue.put(True)
+                                return
+                    result_queue.put(False)
+                except:
+                    result_queue.put(False)
+            
+            thread = threading.Thread(target=quick_process, daemon=True)
+            thread.start()
+            
+            try:
+                has_words = result_queue.get(timeout=3.0)  # Máximo 3 segundos para STT
+                return has_words
+            except queue.Empty:
+                return False  # Si no responde rápido, asumir que no hay palabras
+                
+    except Exception as e:
+        # Si hay cualquier error, asumir que SÍ hay palabras (modo conservador)
+        print(f"[QUICK STT ERROR] {e} - Asumiendo voz válida")
+        return True
+
+def respeaker_v2_interruption_monitor_lightweight():
+    """✅ Monitor de interrupciones ligero que usa solo la API de tuning sin PyAudio"""
+    global interruption_detected
+    
+    # ✅ USAR SOLO LA DETECCIÓN NATIVA DEL RESPEAKER v2.0 (sin PyAudio conflictivo)
+    respeaker_tuning = None
+    try:
+        import sys
+        sys.path.insert(0, './usb_4_mic_array')
+        from tuning import Tuning
+        import usb.core
+        
+        # Encontrar dispositivo USB del ReSpeaker v2.0
+        dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
+        if dev:
+            respeaker_tuning = Tuning(dev)
+            print("🎯 [LIGHTWEIGHT VAD] Usando SOLO detección nativa del ReSpeaker v2.0")
+        else:
+            print("❌ [LIGHTWEIGHT VAD] No se pudo conectar al ReSpeaker")
+            return
+    except Exception as e:
+        print(f"❌ [LIGHTWEIGHT VAD] Error al inicializar tuning: {e}")
+        return
+    
+    consecutive_voice_frames = 0
+    silence_frames = 0
+    initial_silence_period = 30  # Esperar ~1 segundo antes de empezar a detectar
+    
+    print(f"🎤 [RESPEAKER VAD] Monitor ReSpeaker v2.0 activado")
+    print(f"   - Detección: Hardware VAD nativo")
+    print(f"   - Interrupciones directas por voz humana")
+    print(f"   - Frames consecutivos requeridos: {CONSECUTIVE_REQUIRED * 3}")
+    
+    try:
+        while is_speaking and not interruption_detected and not system_shutdown:
+            try:
+                # ✅ CHECK RÁPIDO DE SALIDA cada pocas iteraciones
+                if consecutive_voice_frames % 10 == 0:
+                    if not is_speaking or interruption_detected or system_shutdown:
+                        print("🔄 [LIGHTWEIGHT] Saliendo por señal de control")
+                        break
+                
+                # ✅ PERÍODO INICIAL DE SILENCIO
+                if initial_silence_period > 0:
+                    initial_silence_period -= 1
+                    time.sleep(0.03)  # 30ms entre checks
+                    continue
+                
+                # ✅ USAR SOLO DETECCIÓN NATIVA DEL RESPEAKER
+                speech_detected = respeaker_tuning.read('SPEECHDETECTED')
+                voice_activity = respeaker_tuning.read('VOICEACTIVITY')
+                
+                # ✅ FILTRO MUY ESTRICTO: Solo considerar "real" si ambos están activos consistentemente
+                voice_detected = bool(speech_detected and voice_activity)
+                confidence = 1.0 if voice_detected else 0.0
+                
+                # ✅ DEBUG CADA 30 FRAMES (~1 segundo) - COMENTADO PARA LIMPIAR SALIDA
+                # if consecutive_voice_frames % 30 == 0:
+                #     print(f"🎤 [LIGHTWEIGHT VAD] Speech: {speech_detected}, Voice: {voice_activity}, Combined: {voice_detected}")
+                
+                # ✅ REQUISITO MUY ALTO para evitar falsos positivos
+                if voice_detected:
+                    consecutive_voice_frames += 1
+                    silence_frames = 0
+                    
+                    required_frames = CONSECUTIVE_REQUIRED * 3  # Triple de frames requeridos
+                    
+                    if consecutive_voice_frames >= required_frames:
+                        print(f"\n🛑 [INTERRUPTION] ¡ReSpeaker v2.0 detectó voz humana! (Hardware VAD)")
+                        print(f"   - Confianza hardware: {confidence:.3f}")
+                        print(f"   - Frames consecutivos: {consecutive_voice_frames}")
+                        interruption_detected = True
+                        break
+                else:
+                    consecutive_voice_frames = max(0, consecutive_voice_frames - 2)  # Decrementar más rápido
+                    silence_frames += 1
+                
+                # Reset automático con silencio
+                if silence_frames > 50:  # ~1.5 segundos de silencio
+                    consecutive_voice_frames = 0
+                
+                time.sleep(0.03)  # 30ms entre checks para no saturar
+                    
+            except Exception as e:
+                print(f"[LIGHTWEIGHT MONITOR ERROR] {e}")
+                time.sleep(0.1)
+                
+    except Exception as e:
+        print(f"[RESPEAKER LIGHTWEIGHT MONITOR ERROR] {e}")
+
+def stop_respeaker_v2_interruption_monitor():
+    """✅ Detener monitor específico para ReSpeaker v2.0 - Versión mejorada"""
+    global audio_monitor_thread, is_speaking, interruption_detected
+    
+    # ✅ SEÑALIZAR DETENCIÓN
+    is_speaking = False
+    interruption_detected = True  # Forzar salida del loop
+    
+    # ✅ ESPERAR TERMINACIÓN LIMPIA
+    if audio_monitor_thread and audio_monitor_thread.is_alive():
+        print("🔄 [MONITOR] Deteniendo monitor de interrupciones...")
+        audio_monitor_thread.join(timeout=2.0)  # Más tiempo para terminar limpiamente
+        if audio_monitor_thread.is_alive():
+            print("⚠️ [MONITOR] Monitor no respondió - forzando limpieza")
+    
+    # ✅ LIMPIAR REFERENCIAS
+    audio_monitor_thread = None
+    print("✅ [MONITOR] Monitor de interrupciones detenido")
+
+def add_echo_to_buffer(audio_chunk):
+    """✅ Añadir audio reproducido al buffer para cancelación de eco"""
+    global echo_buffer
+    
+    if isinstance(audio_chunk, bytes):
+        samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+        echo_buffer.extend(samples)
+
+def initialize_respeaker_v2_system():
+    """✅ Inicializar sistema completo ReSpeaker Mic Array v2.0"""
+    print("🎤 [RESPEAKER v2.0] Inicializando sistema...")
+    
+    # 1. Detectar dispositivo específico
+    device = find_respeaker_v2()
+    if not device:
+        print("⚠️ [RESPEAKER v2.0] Usando micrófono por defecto")
+        return False
+    
+    # 2. Configurar parámetros específicos del v2.0
+    if not configure_respeaker_v2():
+        print("⚠️ [RESPEAKER v2.0] Configuración parcial")
+    
+    # 3. Verificar disponibilidad en PyAudio
+    respeaker_index = get_respeaker_v2_device_index()
+    if respeaker_index is None:
+        print("❌ [RESPEAKER v2.0] No disponible en PyAudio")
+        return False
+    
+    print("✅ [RESPEAKER v2.0] Sistema inicializado correctamente")
+    print("🎯 [FEATURES] Beamforming circular + Cancelación de eco adaptativa")
+    return True
+
+# ✅ ========================================
+# FIN SISTEMA INTERRUPCIONES RESPEAKER v2.0
+# =========================================
 
 
 
@@ -1898,20 +2676,47 @@ class MicrophoneStream:
         return None, pyaudio.paContinue
 
     def generator(self):
+        """Generador con timeout adaptativo para evitar cuelgues"""
+        chunk_timeout = 2.0  # Timeout más generoso por chunk (2 segundos)
+        chunks_without_data = 0
+        max_empty_chunks = 3  # Máximo 3 chunks vacíos antes de considerar silencio
+        
         while not self.closed:
-            chunk = self._buff.get()
-            if chunk is None:
-                return
-            data = [chunk]
-            while True:
-                try:
-                    chunk = self._buff.get(block=False)
-                    if chunk is None:
-                        return
-                    data.append(chunk)
-                except queue.Empty:
-                    break
-            yield b"".join(data)
+            try:
+                # ✅ TIMEOUT ADAPTATIVO en get()
+                chunk = self._buff.get(timeout=chunk_timeout)
+                if chunk is None:
+                    return
+                    
+                # Reset contador de chunks vacíos si hay datos
+                chunks_without_data = 0
+                data = [chunk]
+                
+                # Recoger chunks adicionales disponibles
+                while True:
+                    try:
+                        chunk = self._buff.get(block=False)
+                        if chunk is None:
+                            return
+                        data.append(chunk)
+                    except queue.Empty:
+                        break
+                        
+                if data:
+                    yield b"".join(data)
+                    
+            except queue.Empty:
+                # Incrementar contador de timeouts
+                chunks_without_data += 1
+                
+                # Si tenemos demasiados chunks vacíos, podría ser audio problemático
+                if chunks_without_data >= max_empty_chunks:
+                    print("[INFO] 🔇 Detectado silencio prolongado en micrófono")
+                    # Continuar pero con timeout más corto para detectar rápido si vuelve el audio
+                    chunk_timeout = 0.5
+                else:
+                    # Continuar normalmente
+                    continue
 
 # =============================================
 # --- FUNCIÓN DE ESCUCHA CON GOOGLE STT MEJORADA ---
@@ -1950,15 +2755,41 @@ def listen_for_command_google() -> str | None:
 
         print("[INFO] 🎤 Escuchando... (habla ahora)")
         
+        # ✅ TIMEOUT ADAPTATIVO para distinguir entre conversación normal y audio problemático
+        start_time = time.time()
+        max_listen_time = 30.0  # Máximo 30 segundos para conversaciones largas
+        last_audio_time = start_time
+        silence_threshold = 5.0  # Si hay 5 segundos de silencio, timeout más corto
+        
         with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
             audio_generator = stream.generator()
             
             # ✅ El generador ahora SOLO envía audio, como debe ser
             def request_generator():
+                nonlocal last_audio_time
+                audio_chunks_sent = 0
+                
                 for content in audio_generator:
+                    current_time = time.time()
+                    
+                    # ✅ TIMEOUT TOTAL (conversaciones muy largas)
+                    if current_time - start_time > max_listen_time:
+                        print(f"[INFO] ⏰ Timeout total de {max_listen_time}s alcanzado")
+                        break
+                    
+                    # ✅ TIMEOUT POR SILENCIO (detectar audio problemático)
+                    if audio_chunks_sent > 0 and current_time - last_audio_time > silence_threshold:
+                        print(f"[INFO] ⏰ Timeout por silencio de {silence_threshold}s - posible audio problemático")
+                        break
+                        
                     if is_speaking:
                         print("[INFO] Interrumpiendo STT porque el androide está hablando")
                         break
+                    
+                    # Actualizar tiempo y contador
+                    last_audio_time = current_time
+                    audio_chunks_sent += 1
+                    
                     yield speech.StreamingRecognizeRequest(audio_content=content)
 
             try:
@@ -1968,23 +2799,62 @@ def listen_for_command_google() -> str | None:
                     requests=request_generator()
                 )
                 
-                for response in responses:
-                    if is_speaking:
-                        print("[INFO] Descartando transcripción porque el androide está hablando")
-                        return None
+                # ✅ TIMEOUT EXPLÍCITO con tiempo adaptativo
+                import threading
+                import queue
+                
+                result_queue = queue.Queue()
+                # Timeout más largo para permitir conversaciones normales
+                timeout_seconds = 15  # Máximo 15 segundos esperando respuesta de STT
+                
+                def process_responses():
+                    """Procesar respuestas en hilo separado con timeout"""
+                    try:
+                        for response in responses:
+                            if is_speaking:
+                                print("[INFO] Descartando transcripción porque el androide está hablando")
+                                result_queue.put(None)
+                                return
+                                
+                            if response.results and response.results[0].alternatives:
+                                transcript = response.results[0].alternatives[0].transcript.strip()
+                                if transcript:
+                                    result_queue.put(transcript)
+                                    return
                         
-                    if response.results and response.results[0].alternatives:
-                        transcript = response.results[0].alternatives[0].transcript.strip()
-                        if transcript:
-                            return transcript
+                        # Si llegamos aquí, no hubo transcripción válida
+                        result_queue.put(None)
+                    except Exception as e:
+                        print(f"[STT ERROR] Error en procesamiento: {e}")
+                        result_queue.put(None)
+                
+                # Ejecutar en hilo separado
+                response_thread = threading.Thread(target=process_responses, daemon=True)
+                response_thread.start()
+                
+                # Esperar resultado con timeout
+                try:
+                    result = result_queue.get(timeout=timeout_seconds)
+                    if result:
+                        return result
+                except queue.Empty:
+                    print(f"[INFO] ⏰ Timeout de {timeout_seconds}s en STT - audio incomprensible")
+                    return None
 
             except Exception as e:
                 if "Deadline" in str(e) or "DEADLINE_EXCEEDED" in str(e):
-                    print("[INFO] Tiempo agotado - intenta hablar de nuevo")
+                    print("[INFO] ⏰ Tiempo agotado en STT - no se detectó voz clara")
                 elif "inactive" in str(e).lower():
-                    print("[INFO] Stream inactivo - reintentando...")
+                    print("[INFO] 🔄 Stream inactivo - reintentando...")
+                elif "OutOfRange" in str(e):
+                    print("[INFO] 🎤 Audio fuera de rango - habla más cerca del micrófono")
+                elif "InvalidArgument" in str(e):
+                    print("[INFO] 🔊 Audio incomprensible - intenta hablar más claro")
                 else:
-                    print(f"[ERROR] Excepción en Google STT: {e}")
+                    print(f"[ERROR] 🚨 Excepción en Google STT: {e}")
+                    
+                # ✅ AÑADIR PEQUEÑA PAUSA para evitar loops rápidos
+                time.sleep(0.5)
     finally:
         exit_quiet_mode()
     return None
@@ -2266,6 +3136,181 @@ def hablar_generador(text_generator):
             vis_thread.join()
         is_speaking = False
 
+def hablar_generador_respeaker_v2_optimized(text_input):
+    """✅ TTS optimizado específicamente para ReSpeaker Mic Array v2.0 con interrupciones
+    Acepta tanto strings como generadores de texto"""
+    global is_speaking, interruption_detected, echo_buffer, pending_response
+    is_speaking = True
+    interruption_detected = False  # ✅ RESET CRÍTICO AL INICIO
+
+    vis_thread = BrutusVisualizer(display=display) if display else None
+    if vis_thread:
+        vis_thread.start()
+
+    # ✅ INICIAR MONITOR ESPECÍFICO PARA RESPEAKER v2.0
+    start_respeaker_v2_interruption_monitor()
+
+    pa = None
+    stream = None
+    full_response = ""
+    was_interrupted = False
+    
+    try:
+        print("🤖 Androide: ", end="", flush=True)
+        
+        pa = pyaudio.PyAudio()
+        stream = pa.open(format=pyaudio.paInt16, channels=1, rate=24000,
+                         output=True, frames_per_buffer=1024)
+        MAX_AMP = 32768.0
+        
+        sentence_buffer = ""
+        
+        def synthesize_and_play_with_advanced_echo_cancellation(text):
+            """Sintetizar con cancelación de eco avanzada para ReSpeaker v2.0"""
+            global interruption_detected
+            if not text.strip():
+                return False
+                
+            # ✅ VERIFICACIÓN INICIAL
+            if interruption_detected:
+                print(f" [🛑 INTERRUMPIDO ANTES DE SINTETIZAR]")
+                return False
+                
+            try:
+                # ✅ PAUSA ANTES DE SINTETIZAR para evitar auto-detección
+                time.sleep(0.2)  # Dar tiempo al sistema de interrupciones para estabilizarse
+                
+                audio_iter = eleven.text_to_speech.stream(
+                    text=text,
+                    voice_id=VOICE_ID,
+                    model_id='eleven_flash_v2_5',
+                    output_format='pcm_24000'
+                )
+                
+                chunk_count = 0
+                playback_started = False
+                
+                for audio_chunk in audio_iter:
+                    chunk_count += 1
+                    
+                    # ✅ PERÍODO DE GRACIA al inicio de la reproducción
+                    if chunk_count <= 5:  # Ignorar interrupciones en los primeros chunks
+                        stream.write(audio_chunk)
+                        playback_started = True
+                        
+                        # Visualización
+                        if vis_thread and audio_chunk:
+                            samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
+                            if samples.size:
+                                rms = np.sqrt(np.mean(samples**2)) / MAX_AMP
+                                vis_thread.push_level(min(rms * 4.0, 1.0))
+                        continue
+                    
+                    # ✅ VERIFICACIÓN CRÍTICA DESPUÉS DEL PERÍODO DE GRACIA
+                    if interruption_detected:
+                        print(f" [🛑 INTERRUMPIDO EN CHUNK {chunk_count} - ReSpeaker v2.0]")
+                        return False
+                    
+                    # ✅ AÑADIR AUDIO AL BUFFER PARA CANCELACIÓN DE ECO AVANZADA
+                    add_echo_to_buffer(audio_chunk)
+                    
+                    stream.write(audio_chunk)
+                    
+                    # Visualización
+                    if vis_thread and audio_chunk:
+                        samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
+                        if samples.size:
+                            rms = np.sqrt(np.mean(samples**2)) / MAX_AMP
+                            vis_thread.push_level(min(rms * 4.0, 1.0))
+                    
+                    # ✅ VERIFICACIÓN ADICIONAL DESPUÉS DE ESCRIBIR
+                    if interruption_detected:
+                        print(f" [🛑 INTERRUMPIDO DESPUÉS DE CHUNK {chunk_count}]")
+                        return False
+                        
+                return True
+            except Exception as e:
+                print(f"[TTS ERROR] {e}")
+                return False
+        
+        # ✅ MANEJAR TANTO STRINGS COMO GENERADORES
+        if isinstance(text_input, str):
+            # Si es string, convertir a generador simulado
+            text_iterator = [text_input]
+            print(f"📝 [DEBUG] Procesando STRING directo")
+        else:
+            # Si es generador, usar directamente
+            text_iterator = text_input
+            print(f"🔄 [DEBUG] Procesando GENERADOR de texto")
+        
+        # ✅ PROCESAR TEXTO CON VERIFICACIONES CONSTANTES
+        for text_chunk in text_iterator:
+            # ✅ VERIFICACIÓN ANTES DE CADA CHUNK DE TEXTO
+            if interruption_detected:
+                print(f" [🛑 INTERRUMPIDO DURANTE GENERACIÓN DE TEXTO]")
+                was_interrupted = True
+                pending_response = full_response + sentence_buffer  # Guardar lo que falta
+                break
+                
+            if not text_chunk:
+                continue
+                
+            full_response += text_chunk
+            sentence_buffer += text_chunk
+            print(text_chunk, end="", flush=True)
+            
+            # ✅ SINTETIZAR AL FINAL DE CADA FRASE
+            if any(punct in text_chunk for punct in ['.', '!', '?', '\n']):
+                print(f"\n🔊 [TTS] Sintetizando: '{sentence_buffer.strip()[:50]}...'")
+                if not synthesize_and_play_with_advanced_echo_cancellation(sentence_buffer.strip()):
+                    print(f" [🛑 INTERRUMPIDO DURANTE SÍNTESIS]")
+                    was_interrupted = True
+                    pending_response = full_response  # Guardar respuesta completa
+                    break
+                sentence_buffer = ""
+            
+            # ✅ VERIFICACIÓN ADICIONAL DESPUÉS DE CADA CHUNK
+            if interruption_detected:
+                print(f" [🛑 INTERRUMPIDO DESPUÉS DE TEXTO]")
+                was_interrupted = True
+                pending_response = full_response + sentence_buffer
+                break
+        
+        if sentence_buffer.strip() and not interruption_detected:
+            synthesize_and_play_with_advanced_echo_cancellation(sentence_buffer.strip())
+            
+        if not full_response and not was_interrupted:
+            fallback_text = "Repite la frase."
+            print(fallback_text)
+            synthesize_and_play_with_advanced_echo_cancellation(fallback_text)
+
+        print()
+        return was_interrupted or interruption_detected, full_response
+
+    except Exception as e:
+        print(f"[HABLAR-RESPEAKER-v2] {e}")
+        return False, full_response
+    finally:
+        # ✅ DETENER Y RESETEAR SISTEMA COMPLETO
+        print("🔄 [CLEANUP] Limpiando sistema de interrupciones...")
+        stop_respeaker_v2_interruption_monitor()
+        
+        # ✅ RESETEAR ESTADOS GLOBALES (ya declarados al inicio de la función)
+        is_speaking = False
+        interruption_detected = False
+        
+        print("✅ [CLEANUP] Sistema listo para nueva interacción")
+        
+        if stream and stream.is_active():
+            stream.stop_stream()
+            stream.close()
+        if pa:
+            pa.terminate()
+        if vis_thread:
+            vis_thread.stop()
+            vis_thread.join()
+        is_speaking = False
+
 # No olvides reemplazar la llamada a hablar() por hablar_en_stream() en tu main loop
 
 # =============================================
@@ -2275,7 +3320,7 @@ def hablar_generador(text_generator):
 # --- BUCLE PRINCIPAL CORREGIDO Y OPTIMIZADO ---
 # =============================================
 def main():
-    global eyes_active, conversation_history
+    global eyes_active, conversation_history, pending_response, respeaker_v2_available
 
     # ✅ Obtener fecha actual dinámicamente
     now = datetime.now()
@@ -2302,6 +3347,8 @@ def main():
     debug_personality(conversation_history)
     
     last_interaction_time = time.time()
+    last_question = ""  # Para recordar la última pregunta
+    waiting_for_continuation = False
     INACTIVITY_TIMEOUT = 300
     WARNING_TIME = 240
     has_warned = False
@@ -2311,15 +3358,32 @@ def main():
         initialize_eye_servos()
         time.sleep(0.5)
     
+    # ✅ INICIALIZAR RESPEAKER v2.0 AL INICIO
+    respeaker_v2_available = initialize_respeaker_v2_system()
+    
+    if respeaker_v2_available:
+        print("🎤 [STARTUP] Usando ReSpeaker Mic Array v2.0 (SEE-14133)")
+        print("   - Beamforming circular de 4 micrófonos")
+        print("   - Cancelación de eco adaptativa LMS") 
+        print("   - WebRTC VAD profesional")
+        print("   - Detección de interrupciones por voz humana")
+    else:
+        print("🎤 [STARTUP] Usando micrófono estándar")
+    
     print("🚀 [STARTUP] Activando sistema completo...")
     activate_eyes()
     activate_tentacles()
     iniciar_luces()
     
     # Usa la función de hablar optimizada para el saludo
-    hablar("Soy Botijo. ¿Qué quieres ahora, ser inferior?")
+    if respeaker_v2_available:
+        hablar("Soy Botijo. Mi vida es una zarria")
+    else:
+        hablar("Soy Botijo. ¿Qué quieres ahora, ser inferior?")
     
     print("🎤 [READY] Sistema listo - puedes hablar directamente")
+    if respeaker_v2_available:
+        print("💡 [TIP] Puedes interrumpir mis respuestas hablando - el ReSpeaker v2.0 te detectará")
 
     try:
         while True:
@@ -2360,8 +3424,14 @@ def main():
                                 history=conversation_history,
                                 user_msg=command_text
                             )
-                            # Usar función especializada para generadores
-                            hablar_generador(text_generator)
+                            # Usar función especializada para generadores con interrupciones si está disponible
+                            if respeaker_v2_available:
+                                was_interrupted, response_text = hablar_generador_respeaker_v2_optimized(text_generator)
+                                if was_interrupted:
+                                    pending_response = response_text
+                                    print("🗣️ [INTERRUPTION] Respuesta interrumpida. Di 'continúa' para reanudar.")
+                            else:
+                                hablar_generador(text_generator)
                             
                         except Exception as e:
                             print(f"[CHATGPT-TOOLS-ERROR] {e}")
@@ -2385,7 +3455,35 @@ def main():
                     
                     print(f"\n👂 Humano: {command_text}")
                     
-                    # --- BLOQUE DE STREAMING OPTIMIZADO CON BÚSQUEDA WEB PARA CONVERSACIÓN ---
+                    # ✅ VERIFICAR SI ES UNA INTERRUPCIÓN DE CONTINUACIÓN
+                    if pending_response:
+                        # Hay una respuesta pendiente que fue interrumpida
+                        if any(word in command_text.lower() for word in ["continúa", "continua", "sigue", "termina"]):
+                            # El usuario quiere que continúe con la respuesta interrumpida
+                            print("🔄 [CONTINUANDO] Respuesta interrumpida...")
+                            
+                            # Crear generador para la respuesta pendiente
+                            def continue_response():
+                                yield pending_response
+                            
+                            if respeaker_v2_available:
+                                was_interrupted, _ = hablar_generador_respeaker_v2_optimized(continue_response())
+                            else:
+                                hablar_generador(continue_response())
+                                was_interrupted = False
+                            
+                            if not was_interrupted:
+                                pending_response = ""  # Completada exitosamente
+                            continue
+                        else:
+                            # Nueva pregunta, descartar respuesta pendiente
+                            pending_response = ""
+                            print("🗑️ [DESCARTANDO] Respuesta anterior interrumpida")
+                    
+                    # Guardar la pregunta actual
+                    last_question = command_text
+                    
+                    # --- BLOQUE DE STREAMING OPTIMIZADO CON INTERRUPCIONES ---
                     try:
                         # ✅ VERIFICAR personalidad antes de cada respuesta
                         debug_personality(conversation_history)
@@ -2396,12 +3494,36 @@ def main():
                             history=conversation_history,
                             user_msg=command_text
                         )
-                        # Usar función especializada para generadores
-                        hablar_generador(text_generator)
+                        
+                        # ✅ USAR FUNCIÓN CON INTERRUPCIONES SI RESPEAKER v2.0 ESTÁ DISPONIBLE
+                        if respeaker_v2_available:
+                            was_interrupted, response_text = hablar_generador_respeaker_v2_optimized(text_generator)
+                            
+                            if was_interrupted:
+                                # Guardar la respuesta parcial para posible continuación
+                                pending_response = response_text
+                                print(f"\n⏸️ [INTERRUMPIDO] Respuesta guardada ({len(response_text)} caracteres)")
+                                print("💡 [TIP] Puedes decir 'continúa' para que termine la respuesta")
+                                
+                                # También actualizar historial con respuesta parcial si tiene contenido útil
+                                if response_text.strip() and len(response_text.strip()) > 10:
+                                    update_history_safe(conversation_history, command_text, response_text + " [INTERRUMPIDO]")
+                            else:
+                                # Respuesta completada normalmente
+                                pending_response = ""
+                                if response_text.strip():
+                                    update_history_safe(conversation_history, command_text, response_text)
+                        else:
+                            # Usar función estándar sin interrupciones
+                            hablar_generador(text_generator)
                         
                     except Exception as e:
                         print(f"[CHATGPT-TOOLS-ERROR] {e}")
                         hablar("Mis circuitos están sobrecargados. Habla más tarde.")
+                else:
+                    # ✅ MANEJO DE AUDIO INCOMPRENSIBLE O ERRORES DE STT
+                    print("🔊 [STT] No se pudo entender el audio - intenta hablar más claro")
+                    time.sleep(1)  # Pequeña pausa antes de reintentar
             else:
                 time.sleep(0.1)
 
