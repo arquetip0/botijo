@@ -11,6 +11,7 @@ import sounddevice as sd
 from openai import OpenAI
 import json
 import time
+import signal
 import numpy as np
 from PIL import Image, ImageDraw
 import pyaudio
@@ -1918,7 +1919,8 @@ class MicrophoneStream:
 # =============================================
 def listen_for_command_google() -> str | None:
     """
-    Escucha continuamente con Google STT hasta detectar una frase completa.
+    Escucha con Google STT (versión simple pero robusta)
+    ✅ BASADO EN gpt5botijo.py que funciona bien + reintentos básicos
     """
     if not speech_client:
         print("[ERROR] El cliente de Google STT no está disponible.")
@@ -1926,68 +1928,245 @@ def listen_for_command_google() -> str | None:
         return None
 
     enter_quiet_mode()
-    try:
-        if is_speaking:
-            print("[INFO] Esperando a que termine de hablar...")
-            while is_speaking:
-                time.sleep(0.1)
-            time.sleep(0.5)
+    max_retries = 3
+    current_retry = 0
+    
+    while current_retry < max_retries:
+        try:
+            if is_speaking:
+                print("[INFO] Esperando a que termine de hablar...")
+                while is_speaking:
+                    time.sleep(0.1)
+                time.sleep(0.5)
 
-        # Configuración base para la API
-        recognition_config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=STT_RATE,
-            language_code="es-ES",
-            enable_automatic_punctuation=True,
-            use_enhanced=True
-        )
-        # ✅ Objeto de configuración que se pasará a la función
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=recognition_config,
-            interim_results=False,
-            single_utterance=True
-        )
-
-        print("[INFO] 🎤 Escuchando... (habla ahora)")
-        
-        with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
-            audio_generator = stream.generator()
+            # ✅ Configuración simple que funciona (copiada de gpt5botijo.py)
+            recognition_config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=STT_RATE,
+                language_code="es-ES",
+                enable_automatic_punctuation=True,
+                use_enhanced=True
+            )
             
-            # ✅ El generador ahora SOLO envía audio, como debe ser
-            def request_generator():
-                for content in audio_generator:
-                    if is_speaking:
-                        print("[INFO] Interrumpiendo STT porque el androide está hablando")
-                        break
-                    yield speech.StreamingRecognizeRequest(audio_content=content)
+            streaming_config = speech.StreamingRecognitionConfig(
+                config=recognition_config,
+                interim_results=True,  # ✅ ACTIVAR para obtener is_final
+                single_utterance=False  # ✅ False para permitir frases largas
+            )
 
-            try:
-                # ✅ CORRECCIÓN: Pasamos 'config' y 'requests' como argumentos separados
-                responses = speech_client.streaming_recognize(
-                    config=streaming_config,
-                    requests=request_generator()
-                )
+            if current_retry == 0:
+                print("[INFO] 🎤 Escuchando... (habla ahora)")
+            else:
+                print(f"[INFO] 🎤 Reintentando... ({current_retry + 1}/{max_retries})")
+            
+            with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
+                # ✅ NUEVA IMPLEMENTACIÓN CON TIMEOUT EFECTIVO
+                result_queue = queue.Queue()
+                error_queue = queue.Queue()
                 
-                for response in responses:
-                    if is_speaking:
-                        print("[INFO] Descartando transcripción porque el androide está hablando")
-                        return None
+                def stt_thread_worker():
+                    """Worker que ejecuta STT con límite de tiempo estricto"""
+                    try:
+                        last_valid_transcript = ""  # 📝 Guardar última transcripción válida
+                        audio_generator = stream.generator()
+                        start_time = time.time()
                         
-                    if response.results and response.results[0].alternatives:
-                        transcript = response.results[0].alternatives[0].transcript.strip()
-                        if transcript:
-                            return transcript
+                        def request_generator():
+                            request_count = 0
+                            last_audio_time = time.time()
+                            silence_duration = 0.0
+                            
+                            for content in audio_generator:
+                                current_time = time.time()
+                                
+                                # ✅ TIMEOUT MUY GENEROSO: 45 segundos para frases muy largas
+                                if current_time - start_time > 45:
+                                    print("[INFO] ⏰ Timeout máximo alcanzado (45s) - probablemente frase muy larga")
+                                    break
+                                    
+                                if is_speaking:
+                                    print("[INFO] Interrumpiendo STT porque el androide está hablando")
+                                    break
+                                
+                                # ✅ DETECCIÓN INTELIGENTE DE SILENCIO
+                                if content and len(content) > 0:
+                                    # Hay audio, resetear timer de silencio
+                                    last_audio_time = current_time
+                                    silence_duration = 0.0
+                                else:
+                                    # Silencio, calcular duración
+                                    silence_duration = current_time - last_audio_time
+                                
+                                # ✅ SILENCIO MÁS TOLERANTE: 6 segundos para permitir pausas naturales
+                                if silence_duration > 6.0:
+                                    print("[INFO] 🔇 Silencio prolongado real detectado (6s), finalizando")
+                                    break
+                                    
+                                request_count += 1
+                                # ✅ LÍMITE MUY ALTO para conversaciones largas
+                                if request_count > 500:
+                                    print("[INFO] 🔄 Límite de requests alcanzado, finalizando")
+                                    break
+                                    
+                                yield speech.StreamingRecognizeRequest(audio_content=content)
 
-            except Exception as e:
-                if "Deadline" in str(e) or "DEADLINE_EXCEEDED" in str(e):
-                    print("[INFO] Tiempo agotado - intenta hablar de nuevo")
-                elif "inactive" in str(e).lower():
-                    print("[INFO] Stream inactivo - reintentando...")
-                else:
-                    print(f"[ERROR] Excepción en Google STT: {e}")
-    finally:
-        exit_quiet_mode()
+                        # ✅ Llamada STT con timeout muy generoso para frases largas
+                        responses = speech_client.streaming_recognize(
+                            config=streaming_config,
+                            requests=request_generator(),
+                            timeout=40.0  # Timeout muy generoso de 40 segundos
+                        )
+                        
+                        # ✅ PROCESAR RESPUESTAS con timeout menos agresivo
+                        response_start = time.time()
+                        for response in responses:
+                            # ✅ TIMEOUT MUY GENEROSO: 20 segundos para procesar respuestas
+                            if time.time() - response_start > 20:
+                                print("[INFO] ⏰ Timeout de procesamiento alcanzado (20s)")
+                                break
+                                
+                            if is_speaking:
+                                print("[INFO] Descartando transcripción porque el androide está hablando")
+                                result_queue.put(None)
+                                return
+                                
+                            if response.results and response.results[0].alternatives:
+                                transcript = response.results[0].alternatives[0].transcript.strip()
+                                is_final = response.results[0].is_final
+                                
+                                # 📝 SIEMPRE guardar la última transcripción válida
+                                if transcript and len(transcript) > 2:
+                                    last_valid_transcript = transcript
+                                
+                                # 🎯 MOSTRAR transcripción interim para debug
+                                if not is_final and transcript:
+                                    print(f"[DEBUG] Interim: '{transcript}'")
+                                
+                                # ✅ LÓGICA INTELIGENTE MEJORADA
+                                if transcript and len(transcript) > 2:
+                                    # Caso 1: Google dice que es final -> SIEMPRE aceptar
+                                    if is_final:
+                                        print(f"✅ [STT] Final confirmado por Google: '{transcript}'")
+                                        result_queue.put(transcript)
+                                        return
+                                    
+                                    # Caso 2: Frase con puntuación natural -> probable que esté completa
+                                    elif transcript.endswith(('.', '?', '!', ';', ':')):
+                                        print(f"✅ [STT] Frase con puntuación completa: '{transcript}'")
+                                        result_queue.put(transcript)
+                                        return
+                                    
+                                    # Caso 3: Frase muy larga -> probablemente completa
+                                    elif len(transcript) > 40:
+                                        print(f"✅ [STT] Frase larga asumida completa: '{transcript}'")
+                                        result_queue.put(transcript)
+                                        return
+                                    
+                                    # Caso 4: Si no es final, seguir esperando MÁS contenido
+
+                        # ✅ Si terminó el bucle, usar la última transcripción válida si existe
+                        if last_valid_transcript and len(last_valid_transcript) > 5:
+                            print(f"⚠️ [STT] Stream terminó, usando última transcripción válida: '{last_valid_transcript}'")
+                            result_queue.put(last_valid_transcript)
+                        else:
+                            print("⚠️ [STT] Stream terminó sin transcripción útil")
+                            result_queue.put(None)
+                        
+                    except Exception as e:
+                        print(f"⚠️ [STT] Error en worker: {e}")
+                        error_queue.put(e)
+                
+                # ✅ EJECUTAR CON TIMEOUT GLOBAL ESTRICTO
+                stt_thread = threading.Thread(target=stt_thread_worker, daemon=True)
+                stt_thread.start()
+                
+                # ✅ TIMEOUT GLOBAL MUY GENEROSO: máximo 50 segundos para todo el proceso
+                stt_thread.join(timeout=50.0)
+                
+                if stt_thread.is_alive():
+                    print("🚨 [STT] TIMEOUT GLOBAL - Stream realmente colgado, forzando terminación")
+                    # El hilo daemon se terminará automáticamente
+                    raise Exception("Timeout global - stream colgado")
+                
+                # Verificar errores
+                if not error_queue.empty():
+                    raise error_queue.get()
+                
+                # Verificar resultado
+                if not result_queue.empty():
+                    result = result_queue.get()
+                    if result:
+                        return result
+                
+                # Si llegamos aquí, reintentar
+                print("⚠️ [STT] No se obtuvo resultado, reintentando...")
+                current_retry += 1
+                time.sleep(0.5)
+
+        except Exception as e:
+            error_msg = str(e)
+            
+            if "Deadline" in error_msg or "DEADLINE_EXCEEDED" in error_msg or "Timeout" in error_msg:
+                print(f"[INFO] ⏰ Timeout detectado - reintentando... ({error_msg[:50]})")
+                current_retry += 1
+                time.sleep(0.5)
+            elif "inactive" in error_msg.lower():
+                print("[INFO] 🔄 Stream inactivo - reintentando...")
+                current_retry += 1
+                time.sleep(1)
+            elif "unavailable" in error_msg.lower() or "connection" in error_msg.lower():
+                print(f"🌐 [STT] Problema de conectividad - reintentando...")
+                current_retry += 1
+                time.sleep(2)
+            else:
+                print(f"❌ [STT] Error: {e}")
+                current_retry += 1
+                time.sleep(1)
+                
+    # Si agotamos reintentos, mostrar mensaje amigable
+    if current_retry >= max_retries:
+        print("� [STT] Mis oídos necesitaban calibración. Intenta hablar de nuevo.")
+        
+    exit_quiet_mode()
     return None
+
+# ✅ FUNCIÓN ADICIONAL: Verificar conectividad de Google STT
+def test_stt_connectivity():
+    """Función para probar si Google STT está disponible"""
+    try:
+        if not speech_client:
+            return False
+            
+        # Test rápido con configuración mínima
+        test_config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=16000,
+            language_code="es-ES"
+        )
+        
+        # No hacer llamada real, solo verificar que el cliente responda
+        print("🔍 [STT] Verificando conectividad...")
+        return True
+        
+    except Exception as e:
+        print(f"❌ [STT] No hay conectividad: {e}")
+        return False
+
+# ✅ FUNCIÓN DE RECUPERACIÓN: Limpiar estado de STT
+def reset_stt_state():
+    """Limpiar cualquier estado corrupto del STT"""
+    global speech_client
+    try:
+        print("🧹 [STT] Limpiando estado del cliente...")
+        # Recrear cliente si es necesario
+        if not test_stt_connectivity():
+            print("🔄 [STT] Recreando cliente de Google STT...")
+            speech_client = speech.SpeechClient()
+            time.sleep(1)
+        return True
+    except Exception as e:
+        print(f"❌ [STT] Error recreando cliente: {e}")
+        return False
 
 # =============================================
 # --- CALLBACK DE AUDIO SIMPLIFICADO ---
@@ -2335,9 +2514,26 @@ def main():
                 
                 print("💤 [SLEEP] Sistema en reposo - habla para reactivar")
                 
-                # Bucle de reposo para reactivación
+                # Bucle de reposo para reactivación con manejo de errores STT
                 while True:
-                    command_text = listen_for_command_google()
+                    stt_failures = 0
+                    max_stt_failures = 3
+                    command_text = None
+                    
+                    while stt_failures < max_stt_failures and not command_text:
+                        command_text = listen_for_command_google()
+                        
+                        if not command_text:
+                            stt_failures += 1
+                            print(f"⚠️ [SLEEP-STT] Fallo {stt_failures}/{max_stt_failures}")
+                            
+                            if stt_failures >= max_stt_failures:
+                                print("🔄 [SLEEP-STT] Reiniciando sistema STT...")
+                                reset_stt_state()
+                                stt_failures = 0  # Reset después de reparar
+                            else:
+                                time.sleep(1)  # Pausa antes del siguiente intento
+                    
                     if command_text:
                         print(f"\n👂 Reactivando con: {command_text}")
                         activate_eyes()
@@ -2373,35 +2569,57 @@ def main():
                 hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
                 has_warned = True
 
-            # --- LÓGICA DE ESCUCHA PRINCIPAL ---
+            # --- LÓGICA DE ESCUCHA PRINCIPAL CON RECUPERACIÓN STT ---
             if not is_speaking:
-                enter_quiet_mode()
-                command_text = listen_for_command_google()
-                exit_quiet_mode()
-
-                if command_text:
-                    last_interaction_time = time.time()
-                    has_warned = False
+                stt_failures = 0
+                max_stt_failures = 3
+                
+                while stt_failures < max_stt_failures:
+                    command_text = listen_for_command_google()
                     
-                    print(f"\n👂 Humano: {command_text}")
-                    
-                    # --- BLOQUE DE STREAMING OPTIMIZADO CON BÚSQUEDA WEB PARA CONVERSACIÓN ---
-                    try:
-                        # ✅ VERIFICAR personalidad antes de cada respuesta
-                        debug_personality(conversation_history)
+                    if command_text:
+                        # ✅ STT funcionó correctamente
+                        last_interaction_time = time.time()
+                        has_warned = False
+                        stt_failures = 0  # Reset contador de fallos
                         
-                        # ✅ USAR NUEVA FUNCIÓN OPTIMIZADA: ahorra llamadas cuando no hay búsqueda
-                        # ✅ USAR chat_with_tools_generator con modelo gpt-5
-                        text_generator = chat_with_tools_generator(
-                            history=conversation_history,
-                            user_msg=command_text
-                        )
-                        # Usar función especializada para generadores
-                        hablar_generador(text_generator)
+                        print(f"\n👂 Humano: {command_text}")
                         
-                    except Exception as e:
-                        print(f"[CHATGPT-TOOLS-ERROR] {e}")
-                        hablar("Mis circuitos están sobrecargados. Habla más tarde.")
+                        # --- BLOQUE DE STREAMING OPTIMIZADO CON BÚSQUEDA WEB PARA CONVERSACIÓN ---
+                        try:
+                            # ✅ VERIFICAR personalidad antes de cada respuesta
+                            debug_personality(conversation_history)
+                            
+                            # ✅ USAR NUEVA FUNCIÓN OPTIMIZADA: ahorra llamadas cuando no hay búsqueda
+                            # ✅ USAR chat_with_tools_generator con modelo gpt-5
+                            text_generator = chat_with_tools_generator(
+                                history=conversation_history,
+                                user_msg=command_text
+                            )
+                            # Usar función especializada para generadores
+                            hablar_generador(text_generator)
+                            
+                        except Exception as e:
+                            print(f"[CHATGPT-TOOLS-ERROR] {e}")
+                            hablar("Mis circuitos están sobrecargados. Habla más tarde.")
+                        break
+                        
+                    else:
+                        # ✅ STT falló, incrementar contador
+                        stt_failures += 1
+                        print(f"⚠️ [STT] Fallo {stt_failures}/{max_stt_failures}")
+                        
+                        if stt_failures >= max_stt_failures:
+                            print("💥 [STT] Demasiados fallos, reiniciando sistema STT...")
+                            if reset_stt_state():
+                                hablar("Mis oídos necesitaban calibración. Intenta hablar de nuevo.")
+                                stt_failures = 0  # Reset después de reparar
+                            else:
+                                hablar("Hay problemas con mi sistema auditivo. Esperando...")
+                                time.sleep(5)
+                                stt_failures = 0  # Reset y seguir intentando
+                        else:
+                            time.sleep(1)  # Pausa corta antes del siguiente intento
             else:
                 time.sleep(0.1)
 

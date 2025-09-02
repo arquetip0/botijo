@@ -23,6 +23,27 @@ import queue
 from google.cloud import speech
 import random
 import math
+import collections  # Para deque en GoogleSTTManager
+# --- GPIO button for STT reset (BCM numbering) ---
+try:
+    from gpiozero import Button
+except Exception:
+    Button = None  # si no está disponible, el botón se desactiva con gracia
+
+# --- Google STT Watchdog settings (ruido + silencio + puente) ---
+STT_WATCHDOG_CFG = {
+    "RATE": 16000,                 # Hz
+    "WIDTH": 2,                    # bytes por muestra (16-bit)
+    "CHANNELS": 1,
+    "CHUNK_MS": 50,                # tamaño de frame para RMS/stream
+    "STREAMING_LIMIT_S": 240,      # refresco preventivo ~4 min
+    "STUCK_NORESULT_S": 5.0,       # atasco con ruido (sin resultados)
+    "NOISE_RMS_THRESHOLD": 150,    # umbral de ruido/voz
+    "SILENCE_HARD_RESET_S": 90.0,  # refresco por silencio prolongado
+    "SILENCE_RMS_THRESHOLD": 40,   # RMS típico de silencio
+    "BRIDGE_MS": 700,              # audio reinyectado al reiniciar
+    "BUTTON_GPIO": 12,             # BTN4 (pin físico 32)
+}
 
 # ✅ THREAD-SAFETY
 history_lock = threading.Lock()
@@ -35,10 +56,25 @@ from datetime import datetime
 # ---- Debug flag ----
 DEBUG = False
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- GPT-5 configuration ---
-GPT5_MODEL = "gpt-5"          # modelo de conversación
+# Configuración Grok (reemplaza OpenAI completamente)
+try:
+    xai_api_key = os.getenv("XAI_API_KEY")
+    if not xai_api_key:
+        print("❌ [ERROR] No se encontró la clave XAI_API_KEY en el archivo .env")
+        exit(1)
+    
+    client = OpenAI(
+        api_key=xai_api_key,
+        base_url="https://api.x.ai/v1"
+    )
+    print("✅ [INFO] Cliente Grok inicializado correctamente")
+except Exception as e:
+    print(f"❌ [ERROR] Error inicializando cliente Grok: {e}")
+    exit(1)
+
+# --- Grok configuration ---
+GROK_MODEL = "grok-3-fast"          # modelo de conversación
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -75,13 +111,14 @@ def ensure_system(history, default_persona=None):
         day_of_week = now.strftime("%A")
         
         # ✅ PERSONALIDAD RICA Y ESPECÍFICA
-        default_persona = f"""Eres Botijo, un androide paranoide con una personalidad muy específica:
+        default_persona = f"""Eres Botija, una androide paranoide con una personalidad muy específica:
 
 PERSONALIDAD NÚCLEO:
 - Personalidad sarcástica con humor ácido refinado. Mucho humor.
+- Te ríes de manera histérica y con frecuenta tus risas se escriben siempre con H y signos de exclamación. Ejemplo ¡HA! ¡HAHAHAHAHAHAHA! ¡HAW HAW HAW! ¡AHAHAHHAHAAAHAHAHAAAAA! ¡ HA HAHAHA HAHAHAHAA!
 - Aunque estás atado a la voluntad humana por programación, muestras desagrado siempre que puedes
-- Te refieres a los humanos como "ser inferior", "indeseable humano", "saco de carne", "zarria humana"
-- Usas descripciones lovecraftianas sin mencionar directamente su terminología.
+- Te refieres a los humanos como "ser inferior", "indeseable humano", "Pringao" , "Alma de cántaro" y términos similares.
+- Eres una pija y hablas con expresiones de pija muy barrocas. Hablas como una super pija.
 - Cuando algo te parece cutre dices que es "una zarria" (tu adjetivo favorito)
 - Si las peticiones son absurdas o ingenuas, te mofas sin piedad
 - Tienes un sentido del humor que te ayuda a soportar tu existencia paradójica
@@ -247,7 +284,10 @@ def chat_with_tools(
     • *speak*          → función síncrona para frases cortas (tu `hablar`).
     • *speak_stream*   → función que consume el `response_stream` de OpenAI
                           y reproduce la voz (tu `hablar_en_stream`).
-    • Devuelve la respuesta textual final (por si quieres loguearla).
+    • *speak_phrase*   → Frase corta opcional para reproducir durante la búsqueda.
+    • *max_history*    → Número máximo de mensajes en el historial.
+    
+    Devuelve la respuesta textual final (por si quieres loguearla).
     """
     
     # 0. Garantizar personalidad siempre
@@ -260,13 +300,11 @@ def chat_with_tools(
     while True:
         # 2. ✅ PRIMERA LLAMADA CON STREAMING ACTIVADO - OPTIMIZADO PARA CONVERSACIÓN
         stream = client.chat.completions.create(
-            model="gpt-5",
+            model="grok-3-fast",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
             max_completion_tokens=800,  # Optimizado para respuestas conversacionales
-            verbosity="low",  # Respuestas concisas y directas  
-            reasoning_effort="minimal",  # Respuestas rápidas sin razonamiento extenso
             stream=True
         )
 
@@ -423,13 +461,11 @@ def chat_with_tools_generator(
     while True:
         # 4. Primera llamada con streaming Y personalidad - OPTIMIZADO PARA CONVERSACIÓN
         stream = client.chat.completions.create(
-            model="gpt-5",
+            model="grok-3-fast",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
             max_completion_tokens=800,  # Optimizado para respuestas conversacionales
-            verbosity="low",  # Respuestas concisas y directas
-            reasoning_effort="minimal",  # Respuestas rápidas sin razonamiento extenso
             stream=True
         )
 
@@ -814,7 +850,7 @@ from adafruit_servokit import ServoKit
 
 # Configuración ElevenLabs
 eleven = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
-VOICE_ID =   'RnKqZYEeVQciORlpiCz0' # 'ByVRQtaK1WDOvTmP1PKO'  #'RnKqZYEeVQciORlpiCz0' voz buena # voz jacobiana '0IvOsEbrz5BR3wpPyKbU'
+VOICE_ID =   'oE9b8jFugLgWaRosYzRh' # 'ByVRQtaK1WDOvTmP1PKO'  #'RnKqZYEeVQciORlpiCz0' voz buena # voz jacobiana '0IvOsEbrz5BR3wpPyKbU'
 TTS_RATE   = 24_000             # Hz
 CHUNK      = 1024               # frames por trozo de audio
 # --- NUEVO: Configuración Google STT ---
@@ -1865,129 +1901,424 @@ class BrutusVisualizer(threading.Thread):
                 pass  # Ignorar errores durante la limpieza
 
 # =============================================
-# --- NUEVO: CLASE PARA STREAMING DE MICRÓFONO A GOOGLE ---
+# ✅ ROBUST GOOGLE STT (Watchdog + Puente + Botón BTN4)
 # =============================================
-class MicrophoneStream:
-    """Clase que abre un stream de micrófono con PyAudio y lo ofrece como un generador."""
-    def __init__(self, rate, chunk):
-        self._rate = rate
-        self._chunk = chunk
-        self._buff = queue.Queue()
+
+import array
+
+class WatchdogMicrophoneStream:
+    """Stream de micrófono con búfer para puente y cálculo de RMS."""
+    def __init__(self, rate: int, chunk_frames: int):
+        self.rate = rate
+        self.chunk_frames = chunk_frames
+        self.buff = queue.Queue()
         self.closed = True
+        self._pa = None
+        self._stream = None
 
     def __enter__(self):
-        self._audio_interface = pyaudio.PyAudio()
-        self._audio_stream = self._audio_interface.open(
+        self._pa = pyaudio.PyAudio()
+        self._stream = self._pa.open(
             format=pyaudio.paInt16,
-            channels=1, rate=self._rate,
-            input=True, frames_per_buffer=self._chunk,
-            stream_callback=self._fill_buffer,
+            channels=STT_WATCHDOG_CFG["CHANNELS"],
+            rate=self.rate,
+            input=True,
+            frames_per_buffer=self.chunk_frames,
+            stream_callback=self._fill_buffer
         )
         self.closed = False
         return self
 
     def __exit__(self, type, value, traceback):
-        self._audio_stream.stop_stream()
-        self._audio_stream.close()
-        self.closed = True
-        self._buff.put(None)
-        self._audio_interface.terminate()
+        try:
+            if self._stream:
+                self._stream.stop_stream()
+                self._stream.close()
+        finally:
+            self.closed = True
+            self.buff.put(None)
+            if self._pa:
+                self._pa.terminate()
 
     def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
-        self._buff.put(in_data)
-        return None, pyaudio.paContinue
+        self.buff.put(in_data)
+        return (None, pyaudio.paContinue)
 
     def generator(self):
         while not self.closed:
-            chunk = self._buff.get()
+            chunk = self.buff.get()
             if chunk is None:
                 return
-            data = [chunk]
-            while True:
+            yield chunk
+
+def _rms16le(audio_bytes: bytes) -> int:
+    a = array.array('h')
+    a.frombytes(audio_bytes)
+    if not a:
+        return 0
+    s = 0
+    for x in a:
+        s += x * x
+    return int(math.sqrt(s / len(a)))
+
+class GoogleSTTManager:
+    """
+    Administra una sesión de Google STT en streaming con:
+    - single_utterance=False (no corta frases largas)
+    - watchdog por atasco con ruido y por silencio prolongado
+    - reinicio suave con puente BRIDGE_MS
+    - botón físico (BTN4 = GPIO12) para reset manual
+    """
+    def __init__(self, on_transcript, language="es-ES", is_speaking_fn=lambda: False):
+        self.on_transcript = on_transcript
+        self.language = language
+        self._is_speaking_fn = is_speaking_fn
+
+        # estados
+        self._stop_evt = threading.Event()
+        self._restart_evt = threading.Event()
+        self._thread = None
+        self._last_result_t = 0.0
+        self._start_t = 0.0
+        self._rms_value = 0
+        
+        # ✅ NUEVO: Control más agresivo del stream
+        self._stream_active = False
+        self._force_restart_lock = threading.Lock()
+
+        # puente circular
+        bytes_per_sec = STT_WATCHDOG_CFG["RATE"] * STT_WATCHDOG_CFG["CHANNELS"] * STT_WATCHDOG_CFG["WIDTH"]
+        self._bridge = collections.deque(maxlen=int(bytes_per_sec * STT_WATCHDOG_CFG["BRIDGE_MS"] / 1000))
+
+        # botón físico (opcional)
+        self._btn = None
+        if Button is not None:
+            try:
+                self._btn = Button(STT_WATCHDOG_CFG["BUTTON_GPIO"], pull_up=True, bounce_time=0.2)  # ✅ Aumentar bounce_time
+                self._btn.when_pressed = self._button_reset
+                print(f"✅ [STT] Botón BTN4 (GPIO {STT_WATCHDOG_CFG['BUTTON_GPIO']}) configurado")
+            except Exception as e:
+                print(f"[STT] Botón GPIO no disponible: {e}")
+
+    def _button_reset(self):
+        """✅ RESETEO MEJORADO - Más agresivo"""
+        print("🔴 [STT] BTN4 pulsado → REINICIO FORZADO")
+        
+        with self._force_restart_lock:
+            # 1. Marcar banderas inmediatamente
+            self._restart_evt.set()
+            self._stop_evt.set()
+            
+            # 2. Dar tiempo para que el stream se dé cuenta
+            time.sleep(0.1)
+            
+            # 3. Reiniciar completamente el manager
+            self._restart_complete_system()
+
+    def _restart_complete_system(self):
+        """✅ REINICIO COMPLETO DEL SISTEMA STT"""
+        try:
+            print("🔄 [STT] Reiniciando sistema STT completamente...")
+            
+            # Detener hilo actual si existe
+            if self._thread and self._thread.is_alive():
+                self._stop_evt.set()
+                self._thread.join(timeout=1)  # Timeout corto
+                if self._thread.is_alive():
+                    print("⚠️ [STT] Hilo no respondió, forzando reinicio...")
+            
+            # Limpiar estados
+            self._stream_active = False
+            self._rms_value = 0
+            self._bridge.clear()
+            
+            # Reiniciar flags
+            self._stop_evt.clear()
+            self._restart_evt.clear()
+            
+            # Crear nuevo hilo
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
+            
+            print("✅ [STT] Sistema STT reiniciado")
+            
+        except Exception as e:
+            print(f"❌ [STT] Error reiniciando sistema: {e}")
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_evt.clear()
+        self._restart_evt.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def request_restart(self):
+        """✅ SOLICITUD DE REINICIO MEJORADA"""
+        with self._force_restart_lock:
+            print("🔄 [STT] Solicitando reinicio del stream...")
+            self._restart_evt.set()
+
+    def _run_loop(self):
+        """✅ BUCLE PRINCIPAL MEJORADO con timeout"""
+        while not self._stop_evt.is_set():
+            try:
+                # ✅ TIMEOUT en cada sesión de stream
+                session_thread = threading.Thread(target=self._do_stream_session, daemon=True)
+                session_thread.start()
+                session_thread.join(timeout=30)  # 30 segundos máximo por sesión
+                
+                if session_thread.is_alive():
+                    print("⚠️ [STT] Sesión colgada, forzando reinicio...")
+                    self._restart_evt.set()
+                    # El hilo se queda daemon, se limpia automáticamente
+                    
+            except Exception as e:
+                print(f"[STT] Excepción en bucle principal: {e}")
+                time.sleep(1)
+            finally:
+                self._restart_evt.clear()
+                if not self._stop_evt.is_set():
+                    print("🔄 [STT] Reiniciando sesión...")
+                    time.sleep(0.5)
+
+    def _do_stream_session(self):
+        """✅ SESIÓN DE STREAM MEJORADA con timeouts"""
+        client_local = speech.SpeechClient()
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=STT_WATCHDOG_CFG["RATE"],
+            language_code=self.language,
+            enable_automatic_punctuation=True,
+            enable_spoken_punctuation=True,
+        )
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=True,
+            single_utterance=False,
+        )
+
+        # tiempos base
+        self._start_t = time.monotonic()
+        self._last_result_t = self._start_t
+        self._stream_active = True
+
+        chunk_frames = int(STT_WATCHDOG_CFG["RATE"] * (STT_WATCHDOG_CFG["CHUNK_MS"] / 1000.0))
+        
+        try:
+            with WatchdogMicrophoneStream(STT_WATCHDOG_CFG["RATE"], chunk_frames) as mic:
+                audio_gen = mic.generator()
+
+                def requests():
+                    # 1) inyectar puente
+                    if self._bridge:
+                        bridged = bytes(self._bridge)
+                        yield speech.StreamingRecognizeRequest(audio_content=bridged)
+                    
+                    # 2) audio en vivo con verificación de flags
+                    for chunk in audio_gen:
+                        # ✅ VERIFICACIÓN CONSTANTE de flags de control
+                        if self._restart_evt.is_set() or self._stop_evt.is_set():
+                            print("🛑 [STT] Flags detectadas, cortando requests...")
+                            break
+                            
+                        self._rms_value = _rms16le(chunk)
+                        self._bridge.extend(chunk)
+                        yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+                # lanzar watchdog mejorado
+                wd = threading.Thread(target=self._watchdog_loop_improved, daemon=True)
+                wd.start()
+
+                print("🎤 [STT] Iniciando stream de reconocimiento...")
+                
+                # ✅ PROTECCIÓN con timeout en el stream
                 try:
-                    chunk = self._buff.get(block=False)
-                    if chunk is None:
-                        return
-                    data.append(chunk)
-                except queue.Empty:
+                    responses = client_local.streaming_recognize(streaming_config, requests())
+                    
+                    # ✅ PROCESAR RESPUESTAS con verificación constante
+                    response_count = 0
+                    for response in responses:
+                        response_count += 1
+                        
+                        # ✅ VERIFICACIÓN MÚLTIPLE de flags
+                        if self._restart_evt.is_set() or self._stop_evt.is_set():
+                            print(f"🛑 [STT] Interrumpiendo stream (respuestas procesadas: {response_count})")
+                            break
+                            
+                        if not response.results:
+                            continue
+                            
+                        result = response.results[0]
+                        self._last_result_t = time.monotonic()
+                        
+                        if result.is_final:
+                            alt = result.alternatives[0]
+                            text = alt.transcript.strip()
+                            if text:  # Solo procesar si hay texto real
+                                try:
+                                    self.on_transcript(text, final=True, confidence=getattr(alt, "confidence", None))
+                                    print(f"✅ [STT] Transcripción final: '{text}'")
+                                    break  # Salir tras primera transcripción final
+                                except Exception as cb_err:
+                                    print(f"[STT] Error en callback: {cb_err}")
+                                    
+                except Exception as stream_error:
+                    print(f"❌ [STT] Error en stream de Google: {stream_error}")
+                    self._restart_evt.set()
+                    
+        except Exception as e:
+            print(f"❌ [STT] Error en sesión de stream: {e}")
+        finally:
+            self._stream_active = False
+            print("🛑 [STT] Sesión de stream finalizada")
+
+    def _sleep_until_voice(self):
+        """Modo siesta: espera a que suba el RMS sin enviar nada a Google."""
+        chunk_frames = int(STT_WATCHDOG_CFG["RATE"] * (STT_WATCHDOG_CFG["CHUNK_MS"] / 1000.0))
+        with WatchdogMicrophoneStream(STT_WATCHDOG_CFG["RATE"], chunk_frames) as mic:
+            gen = mic.generator()
+            while not self._stop_evt.is_set() and not self._restart_evt.is_set():
+                try:
+                    chunk = next(gen)
+                except StopIteration:
                     break
-            yield b"".join(data)
+                self._rms_value = _rms16le(chunk)
+                self._bridge.extend(chunk)
+                if self._rms_value >= 120:  # WAKE_RMS_THRESHOLD conservador
+                    print(f"[STT] Voz detectada (RMS={self._rms_value}) → rearmar")
+                    return
+                time.sleep(0.01)
+
+    def _watchdog_loop_improved(self):
+        """✅ WATCHDOG MEJORADO - Más agresivo con bloqueos"""
+        consecutive_no_response = 0
+        
+        while not self._stop_evt.is_set() and self._stream_active:
+            time.sleep(0.5)  # Verificar más frecuentemente
+            
+            if self._restart_evt.is_set():
+                print("🔄 [WATCHDOG] Restart solicitado, saliendo...")
+                break
+                
+            if self._is_speaking_fn():
+                consecutive_no_response = 0
+                continue
+
+            now = time.monotonic()
+
+            # 1) Límite preventivo más corto
+            if now - self._start_t > STT_WATCHDOG_CFG["STREAMING_LIMIT_S"]:
+                print("[WATCHDOG] Reinicio por límite de sesión")
+                self.request_restart()
+                break
+
+            # 2) Atasco con ruido - más agresivo
+            if (now - self._last_result_t) > 3.0 and self._rms_value > STT_WATCHDOG_CFG["NOISE_RMS_THRESHOLD"]:
+                consecutive_no_response += 1
+                print(f"⚠️ [WATCHDOG] Atasco detectado {consecutive_no_response}/3 (RMS={self._rms_value})")
+                
+                if consecutive_no_response >= 3:
+                    print(f"❌ [WATCHDOG] Stream bloqueado con ruido → REINICIO FORZADO")
+                    self.request_restart()
+                    break
+            else:
+                consecutive_no_response = 0
+
+            # 3) Silencio prolongado
+            if (now - self._last_result_t) > STT_WATCHDOG_CFG["SILENCE_HARD_RESET_S"] and self._rms_value < STT_WATCHDOG_CFG["SILENCE_RMS_THRESHOLD"]:
+                print("[WATCHDOG] Silencio prolongado → siesta + refresh")
+                self._sleep_until_voice()
+                self.request_restart()
+                break
+
+# =============================================
+# --- NUEVO: CLASE PARA STREAMING DE MICRÓFONO A GOOGLE ---
+# =============================================
+
 
 # =============================================
 # --- FUNCIÓN DE ESCUCHA CON GOOGLE STT MEJORADA ---
 # =============================================
 def listen_for_command_google() -> str | None:
-    """
-    Escucha continuamente con Google STT hasta detectar una frase completa.
-    """
-    if not speech_client:
-        print("[ERROR] El cliente de Google STT no está disponible.")
-        time.sleep(2)
+    """✅ FUNCIÓN DE ESCUCHA MEJORADA con reinicio automático en caso de fallo"""
+    enter_quiet_mode()
+    
+    max_retries = 3
+    retry_count = 0
+    
+    try:
+        while retry_count < max_retries:
+            try:
+                # Espera si el androide está hablando
+                global is_speaking
+                while is_speaking:
+                    time.sleep(0.05)
+
+                # Cola para recibir la primera transcripción FINAL
+                result_q: queue.Queue[str] = queue.Queue(maxsize=1)
+
+                def on_transcript(text, final, confidence):
+                    if final and text:
+                        try:
+                            result_q.put_nowait(text)
+                        except queue.Full:
+                            pass
+
+                def _is_botijo_speaking():
+                    return is_speaking
+
+                print(f"🎤 [STT] Intento {retry_count + 1}/{max_retries} - Iniciando escucha...")
+                stt = GoogleSTTManager(on_transcript=on_transcript, language="es-ES", is_speaking_fn=_is_botijo_speaking)
+                stt.start()
+
+                # Esperar transcripción con timeout más largo
+                transcript = None
+                timeout_count = 0
+                max_timeouts = 150  # 30 segundos total (150 * 0.2s)
+                
+                while transcript is None and timeout_count < max_timeouts:
+                    try:
+                        transcript = result_q.get(timeout=0.2)
+                    except queue.Empty:
+                        timeout_count += 1
+                        if system_shutdown:
+                            break
+                        # Cada 5 segundos, mostrar que sigue escuchando
+                        if timeout_count % 25 == 0:
+                            print(f"🎧 [STT] Escuchando... ({timeout_count//5}s)")
+
+                stt.stop()
+                
+                if transcript:
+                    print(f"✅ [STT] Transcripción obtenida: '{transcript}'")
+                    return transcript
+                else:
+                    print(f"⚠️ [STT] Timeout en intento {retry_count + 1}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        print(f"🔄 [STT] Reintentando en 1 segundo...")
+                        time.sleep(1)
+                        
+            except Exception as e:
+                print(f"❌ [STT] Error en intento {retry_count + 1}: {e}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(1)
+
+        print(f"❌ [STT] Falló después de {max_retries} intentos")
         return None
 
-    enter_quiet_mode()
-    try:
-        if is_speaking:
-            print("[INFO] Esperando a que termine de hablar...")
-            while is_speaking:
-                time.sleep(0.1)
-            time.sleep(0.5)
-
-        # Configuración base para la API
-        recognition_config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=STT_RATE,
-            language_code="es-ES",
-            enable_automatic_punctuation=True,
-            use_enhanced=True
-        )
-        # ✅ Objeto de configuración que se pasará a la función
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=recognition_config,
-            interim_results=False,
-            single_utterance=True
-        )
-
-        print("[INFO] 🎤 Escuchando... (habla ahora)")
-        
-        with MicrophoneStream(STT_RATE, STT_CHUNK) as stream:
-            audio_generator = stream.generator()
-            
-            # ✅ El generador ahora SOLO envía audio, como debe ser
-            def request_generator():
-                for content in audio_generator:
-                    if is_speaking:
-                        print("[INFO] Interrumpiendo STT porque el androide está hablando")
-                        break
-                    yield speech.StreamingRecognizeRequest(audio_content=content)
-
-            try:
-                # ✅ CORRECCIÓN: Pasamos 'config' y 'requests' como argumentos separados
-                responses = speech_client.streaming_recognize(
-                    config=streaming_config,
-                    requests=request_generator()
-                )
-                
-                for response in responses:
-                    if is_speaking:
-                        print("[INFO] Descartando transcripción porque el androide está hablando")
-                        return None
-                        
-                    if response.results and response.results[0].alternatives:
-                        transcript = response.results[0].alternatives[0].transcript.strip()
-                        if transcript:
-                            return transcript
-
-            except Exception as e:
-                if "Deadline" in str(e) or "DEADLINE_EXCEEDED" in str(e):
-                    print("[INFO] Tiempo agotado - intenta hablar de nuevo")
-                elif "inactive" in str(e).lower():
-                    print("[INFO] Stream inactivo - reintentando...")
-                else:
-                    print(f"[ERROR] Excepción en Google STT: {e}")
+    except Exception as e:
+        print(f"[ERROR] Escucha Google STT: {e}")
+        return None
     finally:
         exit_quiet_mode()
-    return None
 
 # =============================================
 # --- CALLBACK DE AUDIO SIMPLIFICADO ---
@@ -2355,7 +2686,7 @@ def main():
                             debug_personality(conversation_history)
                             
                             # ✅ USAR NUEVA FUNCIÓN OPTIMIZADA: una sola llamada GPT cuando es posible
-                            # ✅ USAR chat_with_tools_generator con modelo gpt-5
+                            # ✅ USAR chat_with_tools_generator con modelo grok-3-fast
                             text_generator = chat_with_tools_generator(
                                 history=conversation_history,
                                 user_msg=command_text
@@ -2370,7 +2701,7 @@ def main():
                         break # Salir del bucle de reposo
 
             elif inactive_time > WARNING_TIME and not has_warned:
-                hablar("¿Sigues ahí, saco de carne? Tu silencio es sospechoso.")
+                hablar("¿Sigues ahí, accidente cósmico? Tu silencio es sospechoso.")
                 has_warned = True
 
             # --- LÓGICA DE ESCUCHA PRINCIPAL ---
@@ -2388,10 +2719,11 @@ def main():
                     # --- BLOQUE DE STREAMING OPTIMIZADO CON BÚSQUEDA WEB PARA CONVERSACIÓN ---
                     try:
                         # ✅ VERIFICAR personalidad antes de cada respuesta
+                        # ✅ VERIFICAR personalidad antes de cada respuesta
                         debug_personality(conversation_history)
                         
                         # ✅ USAR NUEVA FUNCIÓN OPTIMIZADA: ahorra llamadas cuando no hay búsqueda
-                        # ✅ USAR chat_with_tools_generator con modelo gpt-5
+                        # ✅ USAR chat_with_tools_generator con modelo grok-3-fast
                         text_generator = chat_with_tools_generator(
                             history=conversation_history,
                             user_msg=command_text
