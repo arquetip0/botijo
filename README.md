@@ -183,3 +183,74 @@ Botijo es un androide paranoide con humor ácido refinado. Se refiere a los huma
 /home/jack/botijo/packett/      — Modelo de visión IMX500
 /venv_chatgpt/                  — Entorno virtual Python
 ```
+
+## Clasificación de Scripts
+
+El repositorio contiene muchas iteraciones de los mismos scripts. Esta sección documenta cuáles son los activos y cuáles son legacy.
+
+### Scripts Fundamentales (Activos)
+
+| Script | Familia | Por qué es fundamental |
+|--------|---------|----------------------|
+| `searchbotijoperplex.py` | Search | Lanzado por `launch_botijo.sh` (launcher principal) |
+| `searchbotijoperplex10.py` | Search | Última iteración con Perplexity (la más completa) |
+| `gpt5botijonew2.py` | GPT5 | Versión más completa: ReSpeaker v2.0, WebRTC VAD, interrupciones |
+| `gpt5botijonew.py` | GPT5 | Lanzado por `launch_botijo_interruptions.sh` |
+| `grokbotijo3.py` | Grok | Versión más avanzada con Grok/xAI + Perplexity |
+| `grokbotijo3pija.py` | Grok | Variante "Botija" (personalidad femenina/histriónica) |
+| `integrator3.py` | Integrator | Lanzado por `launch_integrator.sh` |
+| `integrator5.py` | Integrator | Versión más reciente (sin wake word, siempre escuchando) |
+| `streambotijo2vad.py` | Stream | Última versión streaming con VAD |
+| `menu.py` | Sistema | Menú GUI Tkinter, lanzado por `launch_menu.sh` |
+| `ritmo8_elevenlabs.py` | Ritmo | Visión + ElevenLabs + display Waveshare |
+| `barbagrok.py` | Barbacoa | Grok + modo barbacoa |
+
+Los scripts fundamentales son **autocontenidos**: llevan el código de LEDs, servos, eye tracking, etc. embebido directamente, no importado de módulos compartidos. La única dependencia local compartida es `lib/LCD_1inch9` (driver Waveshare).
+
+### Módulos Locales (importados por otros scripts)
+
+| Script | Importado por | Función |
+|--------|---------------|---------|
+| `botijo_barbacoa.py` | `barbagrok.py` | Setup del modo barbacoa |
+| `phases_botijo.py` | `botijo_barbacoa.py` | Frases para modo barbacoa (6 categorías) |
+| `spirob.py` | `integrapruebas.py`, `pruebastentacle.py` | Movimiento espiral para tentáculos |
+
+### Scripts Standalone de Utilidad
+
+Se ejecutan directamente para probar o controlar hardware:
+
+| Script | Función |
+|--------|---------|
+| `servo8.py` / `servo9.py` / `servo10.py` | Calibración de servos individuales |
+| `tentaclederecho.py` / `tentacleizquierdo.py` | Control tentáculo derecho/izquierdo |
+| `tentaclerandom.py` / `tentaclerandom2.py` | Movimientos aleatorios tentáculos |
+| `tentaclereset.py` / `ojosreset.py` | Reset a posición neutral |
+| `leds.py` | Demo LEDs NeoPixel steampunk |
+| `ojopipa3.py` | Eye tracking con saccades y parpadeo |
+| `eyetracker4.py` | Eye tracker standalone |
+| `face_eye_calibration.py` | Calibración ojos/cara |
+| `brutus.py` | Visualizador de ondas retro |
+| `stuff.py` | Diagnóstico IMX500 |
+| `smooth.py` | Demo suavizado de servos |
+| `debug_audio.py` | Debug de audio |
+| `test_botones.py` | Test de botones GPIO |
+
+### Legacy / Supersedidos
+
+**Integrators:** `integrator1.py`, `integrator2.py`, `integrator4.py`, `integratorpico.py`, `integratorpico2.py`, `integratorpico3.py`, `integratorpico3_fixed.py` (vacío), `integratorsalvacion.py`, `integratorsave.py`, `integrapruebas.py`
+
+**GPT5:** `gpt5botijo.py`, `gpt5botijo2.py`, `gpt5botijo3.py`
+
+**Grok:** `grokbotijo.py`, `grokchat.py`, `grokchatfucional.py`, `grok3.py`, `grokcopilot.py`
+
+**Search:** `searchbotijoperplex2.py` a `searchbotijoperplex9.py`, `searchbotijoperplex67.py`, `searchbotijoperplexbackup.py`, `searchbotijo.py` (DuckDuckGo)
+
+**Stream:** `streambotijo.py`, `streambotijo2.py`, `streambotijointerim.py`, `streambotijogrok.py`
+
+**Ritmo:** `ritmo6.py`, `ritmo7.py`, `ritmo8.py`, `ritmo9.py`
+
+**Eye/Vision:** `eye.py`, `eye2.py`, `eyeraro.py`, `eyetracker.py`, `eyetracker2.py`, `eyetracker3.py`, `ojopipa.py`, `ojopipa2.py`
+
+**Experimentos:** `o3.py`, `o3google.py`, `o3google2.py`, `avanzado.py`, `sinmiedo.py`, `deepseekloco.py`, `kivi.py`, `dcijdcncdijn.py`, `belcebug3.py`, `judasx.py`, `judasxtremo.py`, `gog.py`, `satan.py`, `suso.py`, `prus.py`, `pub.py`, `raruno.py`, `stuffpre.py`, `xmp.py`, `psonido.py`, `purru.py`, `knight.py`, `servoloco.py`, `servitor.py`, `fluid.py`
+
+**Tests:** `test_gpt5.py`, `test_grok.py`, `test_grok_basic.py`, `test_grok_streaming.py`, `test_grok_final.py`, `test_grok_diagnostics.py`, `test_interruptions.py`, `test_respeaker.py`, `test_respeaker_interruptions.py`, `test_respeaker_levels.py`, `test_simple_interruption.py`, `test_final_interruption.py`, `test_amanece.py`, `test_cam_drm.py`, `test_voice_detection.py`, `test_two_keywords.py`, `testenv.py`, `testconvertereleven.py`, `validate_integratorpico3.py`, `test_audio_real.py` (vacío), `test_optimized_flow.py` (vacío)
