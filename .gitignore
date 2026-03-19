@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv*/
+.venv/
+
+# Environment
+.env
+
+# Audio/media
+*.mp3
+*.wav
+*.flac
+
+# Models (large binaries)
+*.onnx
+*.rpk
+*.ppn
+*.bin
+modelos/
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Build
+dist/
+build/
+*.egg-info/
