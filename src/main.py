@@ -8,8 +8,10 @@ import argparse
 import signal
 import sys
 import logging
+import time
 
 from config import get_personality, HARDWARE
+import audio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,14 +63,30 @@ def main():
     log.info("Hardware config loaded: %d servo channels, %d LEDs, %d buttons",
              16, HARDWARE["leds"]["count"], len([k for k in HARDWARE["buttons"] if k.startswith("btn")]))
 
-    # TODO: Initialize modules here (audio, brain, servos, leds, vision, display, buttons)
-    # TODO: Main loop here
+    # Initialize audio module
+    respeaker_ok = audio.init()
+    _modules.append(audio)
+    if respeaker_ok:
+        log.info("Audio: ReSpeaker v2.0 active (VAD + interruption detection)")
+    else:
+        log.info("Audio: initialized without ReSpeaker (degraded mode)")
 
-    log.info("Botijo ready — no modules loaded yet. Mode: %s", args.mode)
-    log.info("Press Ctrl+C to exit")
+    # TODO: Initialize remaining modules (brain, servos, leds, vision, display, buttons)
 
+    log.info("Botijo ready — mode: %s", args.mode)
+    log.info("Starting echo loop: speak -> listen -> repeat. Press Ctrl+C to exit.")
+
+    # Simple echo test loop: listen -> speak back what was heard
     try:
-        signal.pause()  # Wait for signal (Unix only)
+        while True:
+            text = audio.listen()
+            if text:
+                log.info("Heard: %s", text)
+                result = audio.speak(text)
+                if result.interrupted:
+                    log.info("Speech was interrupted")
+            else:
+                time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
