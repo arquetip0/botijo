@@ -13,9 +13,12 @@ import time
 from config import HARDWARE
 import audio
 import brain
+import buttons
+import display
 import leds
 import personality
 import servos
+import vision
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,7 +97,29 @@ def main():
         _modules.append(leds)
         log.warning("LEDs: initialized without hardware (stub mode)")
 
-    # TODO: Initialize remaining modules (vision, display, buttons)
+    # Initialize vision module (IMX500 face detection)
+    if vision.init():
+        _modules.append(vision)
+        log.info("Vision: IMX500 face detection active")
+    else:
+        _modules.append(vision)
+        log.warning("Vision: initialized without hardware (stub mode)")
+
+    # Initialize display module (Waveshare 1.9" LCD)
+    if display.init():
+        _modules.append(display)
+        log.info("Display: Waveshare 1.9\" LCD active (%dx%d)", display.WIDTH, display.HEIGHT)
+    else:
+        _modules.append(display)
+        log.warning("Display: initialized without hardware (stub mode)")
+
+    # Initialize buttons module (4 GPIO buttons)
+    if buttons.init():
+        _modules.append(buttons)
+        log.info("Buttons: 4 GPIO buttons active")
+    else:
+        _modules.append(buttons)
+        log.warning("Buttons: initialized without hardware (stub mode)")
 
     greeting = personality.get_greeting()
     log.info("Greeting: %s", greeting)
@@ -122,8 +147,19 @@ def main():
                 if result.interrupted:
                     brain.note_interruption(result.spoken_text)
                     log.info("Response interrupted")
+
+                # After speaking, check for faces and track
+                faces = vision.get_faces()
+                if faces:
+                    face = faces[0]  # Track largest/closest face
+                    servos.look_at(face.x, face.y)
             else:
                 leds.set_mode("steampunk")
+                # Track faces even during idle
+                faces = vision.get_faces()
+                if faces:
+                    face = faces[0]
+                    servos.look_at(face.x, face.y)
                 time.sleep(0.1)
     except KeyboardInterrupt:
         pass
