@@ -1,0 +1,101 @@
+{
+  "respeaker": {
+    "vid": "0x2886",
+    "pid": "0x0018",
+    "channels": 1,
+    "rate": 16000,
+    "chunk": 480
+  },
+  "vad": {
+    "mode": 3,
+    "frame_duration_ms": 30,
+    "padding_duration_ms": 300,
+    "voice_threshold": 0.3,
+    "consecutive_required": 3,
+    "echo_suppression_factor": 0.4,
+    "echo_buffer_maxlen": 2000
+  },
+  "stt": {
+    "rate": 16000,
+    "language": "es-ES",
+    "use_enhanced": true,
+    "timeout_seconds": 15,
+    "max_listen_seconds": 30,
+    "silence_threshold_seconds": 5
+  },
+  "tts": {
+    "elevenlabs_voice_id": "RnKqZYEeVQciORlpiCz0",
+    "elevenlabs_model": "eleven_flash_v2_5",
+    "elevenlabs_rate": 24000,
+    "elevenlabs_format": "pcm_24000",
+    "playback_chunk": 1024
+  },
+  "servos": {
+    "eye_lr_channel": 0,
+    "eye_ud_channel": 1,
+    "eyelids": {
+      "top_left": {"channel": 2, "open": 50, "closed": 90},
+      "bottom_left": {"channel": 3, "open": 155, "closed": 90},
+      "top_right": {"channel": 4, "open": 135, "closed": 90},
+      "bottom_right": {"channel": 5, "open": 25, "closed": 90}
+    },
+    "tentacle_pitch_channel": 8,
+    "tentacle_left_channel": 15,
+    "tentacle_right_channel": 12,
+    "ear_left_channel": 15,
+    "ear_right_channel": 12,
+    "lr_range": [40, 140],
+    "ud_range": [30, 150],
+    "pulse_width_range": [500, 2500],
+    "tentacle_left_pulse": [300, 2650],
+    "tentacle_right_pulse": [450, 2720]
+  },
+  "eyes": {
+    "blink_probability": 0.01,
+    "blink_duration": 0.12,
+    "double_blink_probability": 0.3,
+    "random_look_probability": 0.01,
+    "random_look_duration": 0.1,
+    "micro_movement_probability": 0.15,
+    "micro_movement_range": 3,
+    "squint_probability": 0.02,
+    "squint_duration": 1.5,
+    "squint_intensity": 0.6,
+    "breathing_enabled": true,
+    "breathing_cycle": 4.0,
+    "breathing_intensity": 0.15
+  },
+  "leds": {
+    "count": 13,
+    "pin": 18,
+    "brightness": 0.05,
+    "paleta": [[184,115,51],[205,133,63],[139,69,19],[112,128,40],[255,215,0],[72,60,50]],
+    "knight_rider_color": [255, 0, 0],
+    "knight_rider_delay": 0.04,
+    "quiet_glow_color": [128, 0, 128]
+  },
+  "display": {
+    "native_width": 170,
+    "native_height": 320,
+    "rotation": 270,
+    "rst_pin": 27,
+    "dc_pin": 25,
+    "bl_pin": 24
+  },
+  "buttons": {
+    "btn1_gpio": 5,
+    "btn2_gpio": 6,
+    "btn3_gpio": 13,
+    "btn4_gpio": 12
+  },
+  "vision": {
+    "rpk_path": "/home/jack/botijo/packett/network.rpk",
+    "labels_path": "/home/jack/botijo/labels.txt",
+    "detection_threshold": 0.2
+  },
+  "behavior": {
+    "inactivity_timeout": 300,
+    "warning_time": 240,
+    "history_max_messages": 20
+  }
+}
