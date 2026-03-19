@@ -13,6 +13,12 @@ rsync -avz --delete config/ "$REMOTE:$REMOTE_DIR/config/"
 rsync -avz --delete tools/ "$REMOTE:$REMOTE_DIR/tools/"
 rsync -avz --delete vendor/ "$REMOTE:$REMOTE_DIR/vendor/"
 rsync -avz requirements.txt "$REMOTE:$REMOTE_DIR/" 2>/dev/null || true
+rsync -avz run_livekit.py "$REMOTE:$REMOTE_DIR/"
+
+# Panel web (lives outside ~/botijo/ on RPi)
+rsync -avz --delete panel/ "$REMOTE:~/panel/"
+rsync -avz panel_backend/app.py "$REMOTE:~/panel_backend/app.py"
+ssh "$REMOTE" "sudo systemctl restart panel-backend"
 echo "✅ Sync complete"
 
 if [ "$1" = "--run" ]; then

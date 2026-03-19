@@ -24,6 +24,24 @@ Plataforma R&D para producción futura de robots conversacionales.
 | `buttons.py` | GPIO buttons with callbacks |
 | `personality.py` | System prompts, tool definitions, phrase pools, `get_current()` accessor |
 | `main.py` | Orchestrator: parse args, init modules, main loop, thread-safe PhraseManager, button↔loop sleep sync |
+| `main_livekit.py` | LiveKit variant of main.py — identical for now, will diverge to use remote STT/TTS via LiveKit |
+
+## Launchers (repo root)
+
+| File | Purpose |
+|------|---------|
+| `run_modular.py` | Launches `src/main.py` (panel btn7) |
+| `run_livekit.py` | Launches `src/main_livekit.py` (panel btn6) |
+
+## Panel Web (panel/ + panel_backend/)
+
+Steampunk control panel served in Chromium kiosk mode on the RPi touchscreen.
+
+- **`panel/`** — Static frontend (HTML/CSS/JS + button/background images). Served as `file://` in Chromium.
+- **`panel_backend/`** — Flask backend (`app.py`, port 5000). Launches scripts, streams stdout, handles Ctrl-C. Runs as systemd service `panel-backend` (`WorkingDirectory=/home/jack/panel_backend`).
+- **Chromium kiosk** — Auto-starts on boot via LXDE autostart, opens `file:///home/jack/panel/index.html`.
+- **8 buttons:** btn1-5 = legacy scripts, btn6 = `run_livekit.py`, btn7 = `run_modular.py`, btn8 = close Chromium.
+- **Deploy:** `deploy.sh` rsyncs `panel/` → `~/panel/` and `panel_backend/app.py` → `~/panel_backend/app.py` (outside `~/botijo/`), then restarts `panel-backend` service.
 
 ## Hardware
 
@@ -34,7 +52,6 @@ RPi 5 (8GB, NVMe 458GB), ReSpeaker 4-Mic USB, IMX500 AI camera (CSI),
 ## Do NOT touch
 
 - `old/` — legacy scripts, reference only
-- `panel/` + `panel_backend/` — web control panel (separate systemd service, RPi only)
 - `venv_chatgpt/` on RPi — managed manually
 - `.env` on RPi — API keys
 

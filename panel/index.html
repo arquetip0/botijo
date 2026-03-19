@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panel Steampunk</title>
+    <!-- Añadimos un parámetro de versión a la hoja de estilos para evitar
+         problemas de caché cuando se actualiza el CSS. -->
+    <link rel="stylesheet" href="css/style.css?v=2" />
+
+    <!-- Estilos en línea para sobreescribir el posicionamiento de la
+         ventana de contenido.  De esta forma nos aseguramos de que
+         el cuadro dinámico no pise el borde metálico incluso si
+         existe caché de la hoja de estilos. -->
+    <style>
+        #content-window {
+            top: 40px;
+            left: 40px;
+            width: 510px;
+            height: 640px;
+            /* margen interior para que los mensajes no toquen el borde metálico */
+            padding: 20px 30px;
+            text-indent: 15px;
+
+            /* que el padding no sume a la anchura total */
+            box-sizing: border-box;
+
+            /* impedir que crezca a la derecha y permitir scroll vertical */
+            overflow-x: hidden;
+            overflow-y: auto;
+
+            /* envolver líneas largas (logs, URLs, etc.) */
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        #content-window pre,
+        #content-window code {
+            white-space: pre-wrap;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            margin: 0;
+        }
+
+        #content-window p {
+            margin: 0 0 0.4em;
+        }
+    </style>
+</head>
+<body>
+    <!-- Contenedor general del panel. Se utiliza la imagen completa como
+         fondo para mantener la estética intacta. -->
+    <div id="panel-container">
+        <!-- Zona dinámica: se superpone al área superior del panel y se
+             utilizará para mostrar consola, vídeo, texto, etc. -->
+        <div id="content-window">
+            <p class="placeholder">Contenido de prueba</p>
+        </div>
+        <!-- Zonas sensibles de los ocho botones. Estas capas son
+             transparentes; la imagen de fondo muestra los botones reales.
+             Cada zona lanza una función distinta al ser pulsada. -->
+      <!-- ... -->
+<div id="btn1" class="btn-hotzone" data-action="run" data-script="old/grokbotijo.py"></div>
+<div id="btn2" class="btn-hotzone" data-action="ctrlc"></div>
+<!-- BTN3 = Ctrl-C al proceso actual -->
+<div id="btn3" class="btn-hotzone" data-action="run" data-script="old/gpt5botijonew2.py"></div>
+
+<div id="btn4" class="btn-hotzone" data-action="run" data-script="old/grokbotijo3pija.py"></div>
+<div id="btn5" class="btn-hotzone" data-action="run" data-script="old/grokbotijo3.py"></div>
+<div id="btn6" class="btn-hotzone" data-action="run" data-script="run_livekit.py"></div>
+<div id="btn7" class="btn-hotzone" data-action="run" data-script="run_modular.py"></div>
+
+<!-- BTN8 = cerrar Chromium -->
+<div id="btn8" class="btn-hotzone" data-action="close-chromium"></div>
+<!-- ... -->
+    </div>
+    <!-- Parametrizamos la importación del script para evitar problemas de caché -->
+    <script src="js/main.js?v=3"></script>
+</body>
+</html>

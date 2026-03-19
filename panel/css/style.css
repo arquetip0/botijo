@@ -1,0 +1,99 @@
+/*
+ * Hoja de estilos para el panel steampunk.
+ * Define un diseño "pixel‑perfect" adaptado a la resolución 600×1024 px
+ * de la Raspberry Pi con Chromium en modo kiosk.  Se utiliza la imagen
+ * del panel completa como fondo y se posicionan las zonas interactivas
+ * (ventana de contenido y botones) de forma absoluta.
+ */
+
+/*
+ * Estilos globales para la WebApp del panel steampunk.
+ * La página está diseñada para ocupar todo el panel de la imagen de fondo
+ * (600 × 1024 px) sin mostrar barras de desplazamiento. El contenedor
+ * principal utiliza la imagen original como fondo y se ajusta a dichas
+ * dimensiones. La zona superior (ventana) se superpone sobre el área
+ * interior del panel y los botones se representan mediante "hotzones"
+ * transparentes que coinciden exactamente con las ubicaciones de los
+ * iconos en la ilustración.
+ */
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    width: 600px;
+    height: 1024px;
+    overflow: hidden;
+    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    /* Color de fondo para rellenar la zona fuera del panel cuando se
+       visualice a mayor resolución (p.ej., en un monitor 1024×600).
+       Se toma un tono oscuro similar al tablero para que la transición
+       sea imperceptible. */
+    background-color: #372211;
+}
+
+/* Contenedor principal que alberga el panel completo.  Se utiliza la
+   imagen original como fondo para conservar la estética steampunk. */
+#panel-container {
+    position: relative;
+    width: 600px;
+    height: 1024px;
+    background: url('../assets/background.jpg') no-repeat center center;
+    /* Ajustar la imagen a sus dimensiones reales para evitar distorsión */
+    background-size: contain;
+}
+
+/* Zona dinámica donde se mostrará texto, consola, vídeo, etc.  Esta capa
+   cubre todo el interior del recuadro superior del panel sin tocar
+   el marco.  Ajusta los valores de top/left/width/height para que se
+   superpongan a la ventana del panel de forma precisa. */
+#content-window {
+    position: absolute;
+    top: 30px;
+    left: 30px;
+    /* Ajustar el tamaño del contenedor para dejar un pequeño margen
+       respecto al marco metálico. */
+    width: 540px;
+    height: 620px;
+    overflow: hidden;
+    color: #e6d8a2;
+    font-size: 18px;
+    line-height: 1.4;
+    /* Acolchado interior para que el texto no toque el borde metálico */
+    padding: 10px;
+    background-color: transparent;
+}
+
+/* Hotzones transparentes que representan cada botón.  Se sitúan de forma
+   absoluta sobre los iconos reales del panel para capturar los clics.
+   El cursor cambia a "pointer" al pasar sobre ellos.  Se aplican
+   ligeros efectos visuales para indicar hover y clic sin alterar la
+   estética general. */
+.btn-hotzone {
+    position: absolute;
+    width: 140px;
+    height: 160px;
+    cursor: pointer;
+    background-color: rgba(255, 255, 255, 0); /* inicialmente invisible */
+    transition: background-color 0.2s;
+}
+
+.btn-hotzone:hover {
+    background-color: rgba(255, 255, 255, 0.05); /* pequeño resplandor al pasar el ratón */
+}
+
+.btn-hotzone:active {
+    background-color: rgba(0, 0, 0, 0.1); /* oscurece ligeramente al hacer clic */
+}
+
+/* Posiciones exactas de las ocho zonas de botones.  Estos valores se
+   calcularon a partir de la imagen original para que las zonas
+   coincidan con los iconos. */
+#btn1 { left: 20px;  top: 690px; }
+#btn2 { left: 160px; top: 690px; }
+#btn3 { left: 300px; top: 690px; }
+#btn4 { left: 440px; top: 690px; }
+#btn5 { left: 20px;  top: 850px; }
+#btn6 { left: 160px; top: 850px; }
+#btn7 { left: 300px; top: 850px; }
+#btn8 { left: 440px; top: 850px; }
