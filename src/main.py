@@ -14,6 +14,7 @@ from config import HARDWARE
 import audio
 import brain
 import personality
+import servos
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,7 +77,15 @@ def main():
         _modules.append(audio)
         log.warning("Audio: initialized without ReSpeaker (degraded mode)")
 
-    # TODO: Initialize remaining modules (servos, leds, vision, display, buttons)
+    # Initialize servo module (eyes, eyelids, tentacles)
+    if servos.init():
+        _modules.append(servos)
+        log.info("Servos: PCA9685 active (eyes + eyelids + tentacles)")
+    else:
+        _modules.append(servos)
+        log.warning("Servos: initialized without hardware (stub mode)")
+
+    # TODO: Initialize remaining modules (leds, vision, display, buttons)
 
     greeting = personality.get_greeting()
     log.info("Greeting: %s", greeting)
@@ -91,7 +100,9 @@ def main():
     log.info("Botijo ready — listening...")
     try:
         while True:
+            servos.set_quiet_mode(True)
             text = audio.listen()
+            servos.set_quiet_mode(False)
             if text:
                 log.info("Heard: %s", text)
                 chunks = brain.chat_stream(text)
