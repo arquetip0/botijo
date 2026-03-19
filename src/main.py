@@ -10,8 +10,10 @@ import sys
 import logging
 import time
 
-from config import get_personality, HARDWARE
+from config import HARDWARE
 import audio
+import brain
+import personality
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,35 +60,47 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    personality = get_personality(args.mode)
-    log.info("Botijo starting — mode: %s, llm: %s", personality["name"], personality["llm"])
+    log.info("Botijo starting — mode: %s", args.mode)
     log.info("Hardware config loaded: %d servo channels, %d LEDs, %d buttons",
              16, HARDWARE["leds"]["count"], len([k for k in HARDWARE["buttons"] if k.startswith("btn")]))
 
+    # Initialize brain (loads personality + LLM clients)
+    brain.init(args.mode)
+    _modules.append(brain)
+
     # Initialize audio module
-    respeaker_ok = audio.init()
-    _modules.append(audio)
-    if respeaker_ok:
+    if audio.init():
+        _modules.append(audio)
         log.info("Audio: ReSpeaker v2.0 active (VAD + interruption detection)")
     else:
-        log.info("Audio: initialized without ReSpeaker (degraded mode)")
+        _modules.append(audio)
+        log.warning("Audio: initialized without ReSpeaker (degraded mode)")
 
-    # TODO: Initialize remaining modules (brain, servos, leds, vision, display, buttons)
+    # TODO: Initialize remaining modules (servos, leds, vision, display, buttons)
 
-    log.info("Botijo ready — mode: %s", args.mode)
-    log.info("Starting echo loop: speak -> listen -> repeat. Press Ctrl+C to exit.")
+    greeting = personality.get_greeting()
+    log.info("Greeting: %s", greeting)
 
-    # Simple echo test loop: listen -> speak back what was heard
+    # Try to speak greeting
+    try:
+        audio.speak(greeting)
+    except Exception as e:
+        log.warning("Could not speak greeting: %s", e)
+
+    # Main conversational loop
+    log.info("Botijo ready — listening...")
     try:
         while True:
             text = audio.listen()
             if text:
                 log.info("Heard: %s", text)
-                result = audio.speak(text)
+                chunks = brain.chat_stream(text)
+                result = audio.speak_stream(chunks)
                 if result.interrupted:
-                    log.info("Speech was interrupted")
+                    brain.note_interruption(result.spoken_text)
+                    log.info("Response interrupted")
             else:
-                time.sleep(0.5)
+                time.sleep(0.1)
     except KeyboardInterrupt:
         pass
     finally:
