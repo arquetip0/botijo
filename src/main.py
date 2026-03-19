@@ -352,20 +352,19 @@ def _run_conversational():
                     # Wake up hardware
                     servos.set_quiet_mode(False)
                     leds.set_mode("steampunk")
-                    display.show_eyes("neutral")
+                    display.show_waveform(0.0)
 
                     _speak_safe("Ah, has vuelto. Procesando tu peticion.")
 
                     # Process the wake-up text as a normal query
                     leds.set_mode("speaking")
-                    display.show_waveform(0.5)
                     chunks = brain.chat_stream(text)
                     result = audio.speak_stream(chunks)
                     if result.interrupted:
                         brain.note_interruption(result.spoken_text)
                         log.info("Response interrupted")
                     leds.set_mode("steampunk")
-                    display.show_eyes("neutral")
+                    display.show_waveform(0.0)
                     last_activity = time.time()
                 else:
                     time.sleep(0.1)
@@ -391,7 +390,6 @@ def _run_conversational():
             # --- Normal listening ---
             servos.set_quiet_mode(True)
             leds.set_mode("listening")
-            display.show_eyes("neutral")
 
             text = audio.listen()
 
@@ -404,7 +402,6 @@ def _run_conversational():
 
                 # Respond
                 leds.set_mode("speaking")
-                display.show_waveform(0.5)
 
                 chunks = brain.chat_stream(text)
                 result = audio.speak_stream(chunks)
@@ -414,7 +411,6 @@ def _run_conversational():
                     log.info("Response interrupted — user can say 'continua'/'sigue'")
 
                 leds.set_mode("steampunk")
-                display.show_eyes("neutral")
             else:
                 # No speech detected — idle
                 leds.set_mode("steampunk")
@@ -496,7 +492,6 @@ def _run_barbacoa():
             if text:
                 log.info("[BARBACOA] Heard: %s", text)
                 leds.set_mode("speaking")
-                display.show_waveform(0.5)
 
                 chunks = brain.chat_stream(text)
                 result = audio.speak_stream(chunks)
@@ -505,7 +500,6 @@ def _run_barbacoa():
                     brain.note_interruption(result.spoken_text)
 
                 leds.set_mode("steampunk")
-                display.show_eyes("neutral")
             else:
                 leds.set_mode("steampunk")
                 time.sleep(0.1)
@@ -554,7 +548,7 @@ def main():
             log.info("Button 1: waking up")
             servos.set_quiet_mode(False)
             leds.set_mode("steampunk")
-            display.show_eyes("neutral")
+            display.show_waveform(0.0)
 
     def _btn2_reset_history():
         """Reset conversation history."""
@@ -579,8 +573,8 @@ def main():
     log.info("Greeting: %s", greeting)
     _speak_safe(greeting)
 
-    # --- Show initial eyes ---
-    display.show_eyes("neutral")
+    # --- Start waveform (idle sine wave on LCD) ---
+    display.show_waveform(0.0)
     leds.set_mode("steampunk")
 
     # --- Run appropriate loop ---
