@@ -13,6 +13,7 @@ import time
 from config import HARDWARE
 import audio
 import brain
+import leds
 import personality
 import servos
 
@@ -85,7 +86,15 @@ def main():
         _modules.append(servos)
         log.warning("Servos: initialized without hardware (stub mode)")
 
-    # TODO: Initialize remaining modules (leds, vision, display, buttons)
+    # Initialize LED module (NeoPixel animations)
+    if leds.init():
+        _modules.append(leds)
+        log.info("LEDs: NeoPixel active (steampunk animation running)")
+    else:
+        _modules.append(leds)
+        log.warning("LEDs: initialized without hardware (stub mode)")
+
+    # TODO: Initialize remaining modules (vision, display, buttons)
 
     greeting = personality.get_greeting()
     log.info("Greeting: %s", greeting)
@@ -101,16 +110,20 @@ def main():
     try:
         while True:
             servos.set_quiet_mode(True)
+            leds.set_mode("listening")
             text = audio.listen()
             servos.set_quiet_mode(False)
             if text:
                 log.info("Heard: %s", text)
                 chunks = brain.chat_stream(text)
+                leds.set_mode("speaking")
                 result = audio.speak_stream(chunks)
+                leds.set_mode("steampunk")
                 if result.interrupted:
                     brain.note_interruption(result.spoken_text)
                     log.info("Response interrupted")
             else:
+                leds.set_mode("steampunk")
                 time.sleep(0.1)
     except KeyboardInterrupt:
         pass
