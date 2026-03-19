@@ -10,8 +10,6 @@ Public API:
     cleanup()           -> None          Release all resources
 """
 
-import collections
-import io
 import logging
 import queue
 import subprocess
@@ -20,6 +18,21 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+
+# Suppress ALSA warnings that spam the console on Linux
+import ctypes
+try:
+    _ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(
+        None, ctypes.c_char_p, ctypes.c_int,
+        ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+    )
+    def _py_error_handler(filename, line, function, err, fmt):
+        pass
+    _c_error_handler = _ERROR_HANDLER_FUNC(_py_error_handler)
+    _asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+    _asound.snd_lib_error_set_handler(_c_error_handler)
+except OSError:
+    pass  # Not on Linux or ALSA not available
 
 # Hardware-dependent imports — may not be available on dev machines
 try:
@@ -37,12 +50,6 @@ try:
     import usb.util
 except ImportError:
     usb = None
-
-try:
-    from scipy.signal import butter, filtfilt
-except ImportError:
-    butter = None
-    filtfilt = None
 
 try:
     from google.cloud import speech
@@ -79,8 +86,8 @@ _shutdown = threading.Event()       # signals module shutdown
 _is_speaking = False                # True while TTS is playing
 _interruption_detected = False      # True when voice interruption confirmed
 _interrupt_lock = threading.Lock()  # guards _is_speaking + _interruption_detected
-_echo_buffer = collections.deque(maxlen=HARDWARE["vad"]["echo_buffer_maxlen"])
 _monitor_thread = None              # daemon thread for interruption monitor
+_respeaker_tuning = None            # Cached Tuning object for interruption monitor
 _speech_client = None               # Google Cloud Speech client
 _eleven_client = None               # ElevenLabs client
 _on_audio_level = None              # optional callback(float) for waveform display
@@ -93,17 +100,11 @@ _TTS_CFG = HARDWARE["tts"]
 
 _RESPEAKER_VID = int(_RS["vid"], 16)
 _RESPEAKER_PID = int(_RS["pid"], 16)
-_RESPEAKER_CHANNELS = _RS["channels"]
 _RESPEAKER_RATE = _RS["rate"]
-_RESPEAKER_CHUNK = _RS["chunk"]
 
 _VAD_MODE = _VAD_CFG["mode"]
 _FRAME_DURATION_MS = _VAD_CFG["frame_duration_ms"]
-_PADDING_DURATION_MS = _VAD_CFG["padding_duration_ms"]
-_NUM_PADDING_FRAMES = int(_PADDING_DURATION_MS / _FRAME_DURATION_MS)
-_VOICE_THRESHOLD = _VAD_CFG["voice_threshold"]
 _CONSECUTIVE_REQUIRED = _VAD_CFG["consecutive_required"]
-_ECHO_SUPPRESSION_FACTOR = _VAD_CFG["echo_suppression_factor"]
 
 _STT_RATE = _STT_CFG["rate"]
 _STT_CHUNK = int(_STT_RATE * _FRAME_DURATION_MS / 1000)
@@ -162,6 +163,7 @@ def _configure_respeaker():
 
         # Try to configure hardware VAD via tuning interface
         try:
+            global _respeaker_tuning
             import sys
             sys.path.insert(0, "./usb_4_mic_array")
             from tuning import Tuning
@@ -173,6 +175,7 @@ def _configure_respeaker():
                 vad_threshold = tuning.read("GAMMAVAD_SR")
                 agc_status = tuning.read("AGCONOFF")
                 log.info("Hardware VAD configured: threshold=%.1f, AGC=%s", vad_threshold, agc_status)
+                _respeaker_tuning = tuning
         except Exception as e:
             log.debug("Hardware VAD tuning not available: %s", e)
 
@@ -212,66 +215,7 @@ def _get_device_index():
 
 
 # ---------------------------------------------------------------------------
-# 2. VAD and voice detection (private)
-# ---------------------------------------------------------------------------
-
-def _bandpass_filter(data, lowcut, highcut, fs, order=4):
-    """Butterworth bandpass filter for voice frequency range."""
-    if butter is None or filtfilt is None:
-        return data
-    nyquist = 0.5 * fs
-    low = lowcut / nyquist
-    high = highcut / nyquist
-    b, a = butter(order, [low, high], btype="band")
-    return filtfilt(b, a, data)
-
-
-def _voice_detection_mono(audio_float):
-    """Detect voice in mono float audio. Returns (is_voice, confidence)."""
-    try:
-        if len(audio_float) < _RESPEAKER_CHUNK:
-            return False, 0.0
-
-        audio_clipped = np.clip(audio_float, -1.0, 1.0)
-        audio_int16 = (audio_clipped * 32767).astype(np.int16)
-
-        chunk_size = _RESPEAKER_CHUNK
-
-        if len(audio_int16) >= chunk_size:
-            chunk = audio_int16[:chunk_size]
-
-            try:
-                is_speech = _vad.is_speech(chunk.tobytes(), _RESPEAKER_RATE)
-
-                if is_speech:
-                    rms = np.sqrt(np.mean(chunk.astype(np.float32) ** 2))
-                    confidence = max(0.1, min(1.0, rms / 5000.0))
-                    return True, confidence
-                else:
-                    # Energy fallback when VAD says no
-                    rms = np.sqrt(np.mean(chunk.astype(np.float32) ** 2))
-                    if rms > 500.0:
-                        confidence = min(1.0, rms / 3000.0)
-                        return True, confidence
-                    return False, 0.0
-
-            except Exception as vad_err:
-                log.debug("VAD frame error, using energy fallback: %s", vad_err)
-                rms = np.sqrt(np.mean(chunk.astype(np.float32) ** 2))
-                if rms > 800.0:
-                    confidence = min(1.0, rms / 4000.0)
-                    return True, confidence
-                return False, 0.0
-
-        return False, 0.0
-
-    except Exception as e:
-        log.debug("Voice detection mono error: %s", e)
-        return False, 0.0
-
-
-# ---------------------------------------------------------------------------
-# 3. Interruption monitor (private)
+# 2. Interruption monitor (private)
 # ---------------------------------------------------------------------------
 
 def _interruption_monitor():
@@ -282,23 +226,25 @@ def _interruption_monitor():
     """
     global _interruption_detected
 
-    # Try hardware tuning interface first (no PyAudio conflict)
-    respeaker_tuning = None
-    try:
-        import sys
-        sys.path.insert(0, "./usb_4_mic_array")
-        from tuning import Tuning
+    # Use cached tuning object, or try to create one as fallback
+    if _respeaker_tuning is not None:
+        respeaker_tuning = _respeaker_tuning
+    else:
+        try:
+            import sys
+            sys.path.insert(0, "./usb_4_mic_array")
+            from tuning import Tuning
 
-        dev = usb.core.find(idVendor=_RESPEAKER_VID, idProduct=_RESPEAKER_PID)
-        if dev:
-            respeaker_tuning = Tuning(dev)
-            log.debug("Interruption monitor using hardware VAD")
-        else:
-            log.warning("Cannot connect to ReSpeaker tuning — monitor disabled")
+            dev = usb.core.find(idVendor=_RESPEAKER_VID, idProduct=_RESPEAKER_PID)
+            if dev:
+                respeaker_tuning = Tuning(dev)
+                log.debug("Interruption monitor using hardware VAD (fallback)")
+            else:
+                log.warning("Cannot connect to ReSpeaker tuning — monitor disabled")
+                return
+        except Exception as e:
+            log.warning("Hardware VAD tuning unavailable: %s — monitor disabled", e)
             return
-    except Exception as e:
-        log.warning("Hardware VAD tuning unavailable: %s — monitor disabled", e)
-        return
 
     consecutive = 0
     silence_frames = 0
@@ -381,15 +327,8 @@ def _stop_monitor():
     _monitor_thread = None
 
 
-def _add_echo(audio_chunk):
-    """Add played audio to echo buffer for cancellation."""
-    if isinstance(audio_chunk, bytes):
-        samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-        _echo_buffer.extend(samples)
-
-
 # ---------------------------------------------------------------------------
-# 4. STT — Google Cloud Speech (public: listen)
+# 3. STT — Google Cloud Speech (public: listen)
 # ---------------------------------------------------------------------------
 
 class _MicrophoneStream:
@@ -402,12 +341,19 @@ class _MicrophoneStream:
         self.closed = True
 
     def __enter__(self):
-        self._audio_interface = pyaudio.PyAudio()
+        # Use shared PyAudio instance, or create temporary one if not available
+        if _pa is not None:
+            self._audio_interface = _pa
+            self._owns_pa = False
+        else:
+            self._audio_interface = pyaudio.PyAudio()
+            self._owns_pa = True
         self._audio_stream = self._audio_interface.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=self._rate,
             input=True,
+            input_device_index=_device_index,
             frames_per_buffer=self._chunk,
             stream_callback=self._fill_buffer,
         )
@@ -419,7 +365,8 @@ class _MicrophoneStream:
         self._audio_stream.close()
         self.closed = True
         self._buff.put(None)
-        self._audio_interface.terminate()
+        if self._owns_pa:
+            self._audio_interface.terminate()
 
     def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
         self._buff.put(in_data)
@@ -564,10 +511,12 @@ def listen() -> str:
 
                 try:
                     result = result_q.get(timeout=timeout_seconds)
+                    t.join(timeout=2)
                     if result:
                         return result
                 except queue.Empty:
                     log.info("STT timeout (%ds) — no clear speech detected", timeout_seconds)
+                    t.join(timeout=2)
 
             except Exception as e:
                 err = str(e)
@@ -590,7 +539,7 @@ def listen() -> str:
 
 
 # ---------------------------------------------------------------------------
-# 5. TTS — ElevenLabs + espeak-ng fallback (public: speak, speak_stream)
+# 4. TTS — ElevenLabs + espeak-ng fallback (public: speak, speak_stream)
 # ---------------------------------------------------------------------------
 
 def _speak_espeak(text):
@@ -624,7 +573,7 @@ def _speak_elevenlabs_sentence(pa_stream, text):
 
     try:
         # Small pause to let interruption system stabilize
-        time.sleep(0.2)
+        time.sleep(0.05)
 
         audio_iter = _eleven_client.text_to_speech.stream(
             text=text,
@@ -647,9 +596,6 @@ def _speak_elevenlabs_sentence(pa_stream, text):
             if _interruption_detected:
                 log.info("Interrupted at chunk %d", chunk_count)
                 return False
-
-            # Add to echo buffer for cancellation
-            _add_echo(audio_chunk)
 
             # Push RMS level to waveform callback
             if _on_audio_level is not None:
@@ -692,12 +638,14 @@ def _speak_elevenlabs(chunks):
     _start_monitor()
 
     pa_inst = None
+    owns_pa = False
     pa_stream = None
     full_response = ""
     was_interrupted = False
 
     try:
-        pa_inst = pyaudio.PyAudio()
+        pa_inst = _pa or pyaudio.PyAudio()
+        owns_pa = _pa is None
         pa_stream = pa_inst.open(
             format=pyaudio.paInt16,
             channels=1,
@@ -766,7 +714,7 @@ def _speak_elevenlabs(chunks):
                 pa_stream.close()
             except Exception:
                 pass
-        if pa_inst:
+        if owns_pa and pa_inst:
             try:
                 pa_inst.terminate()
             except Exception:
@@ -821,7 +769,7 @@ def speak_stream(chunks) -> SpeakResult:
 
 
 # ---------------------------------------------------------------------------
-# 6. Public helpers
+# 5. Public helpers
 # ---------------------------------------------------------------------------
 
 def set_audio_level_callback(callback):
@@ -848,7 +796,7 @@ def stop_speaking() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 7. init() and cleanup()
+# 6. init() and cleanup()
 # ---------------------------------------------------------------------------
 
 def init() -> bool:
@@ -914,13 +862,22 @@ def init() -> bool:
         log.warning("ReSpeaker not available in PyAudio")
         return False
 
+    # 6. Create shared PyAudio instance
+    if pyaudio is not None:
+        try:
+            _pa = pyaudio.PyAudio()
+            log.info("Shared PyAudio instance created")
+        except Exception as e:
+            log.error("PyAudio init failed: %s", e)
+            _pa = None
+
     log.info("Audio subsystem initialized (ReSpeaker at index %d)", _device_index)
     return True
 
 
 def cleanup() -> None:
     """Release all audio resources."""
-    global _pa, _vad, _device_index, _speech_client, _eleven_client
+    global _pa, _vad, _device_index, _speech_client, _eleven_client, _respeaker_tuning
 
     log.info("Cleaning up audio subsystem...")
 
@@ -929,10 +886,18 @@ def cleanup() -> None:
     # Stop any active monitor
     _stop_monitor()
 
-    _pa = None
+    # Terminate shared PyAudio instance
+    if _pa is not None:
+        try:
+            _pa.terminate()
+        except Exception:
+            pass
+        _pa = None
+
     _vad = None
     _device_index = None
     _speech_client = None
     _eleven_client = None
+    _respeaker_tuning = None
 
     log.info("Audio subsystem cleaned up")

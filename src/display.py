@@ -219,31 +219,24 @@ def _waveform_loop():
             if _HAS_NUMPY:
                 base_wave = np.sin((x_vals / _WV_WAVELENGTH) + phase) * _WV_BASE_AMP
 
+                # Draw base wave as polyline
+                base_points = [(x, int(cy - base_wave[x] * cy)) for x in range(WIDTH)]
+                draw.line(base_points, fill=_WV_BASE_COLOR)
+
+                # Draw noise overlay when speaking
                 if smoothed_level > 0.02:
                     noise_strength = _WV_GAIN_NOISE * smoothed_level ** 1.5
                     noise = np.random.normal(0.0, noise_strength, size=WIDTH)
                     wave = np.clip(base_wave + noise, -1.0, 1.0)
-                else:
-                    wave = base_wave
-
-                # Draw base wave
-                for x in range(WIDTH - 1):
-                    y1 = int(cy - base_wave[x] * cy)
-                    y2 = int(cy - base_wave[x + 1] * cy)
-                    draw.line((x, y1, x + 1, y2), fill=_WV_BASE_COLOR)
-
-                # Draw noise overlay when speaking
-                if smoothed_level > 0.02:
-                    for x in range(WIDTH - 1):
-                        y1 = int(cy - wave[x] * cy)
-                        y2 = int(cy - wave[x + 1] * cy)
-                        draw.line((x, y1, x + 1, y2), fill=_WV_NOISE_COLOR)
+                    noise_points = [(x, int(cy - wave[x] * cy)) for x in range(WIDTH)]
+                    draw.line(noise_points, fill=_WV_NOISE_COLOR)
             else:
                 # Pure-math fallback (no numpy)
-                for x in range(WIDTH - 1):
-                    y1 = int(cy - math.sin((x / _WV_WAVELENGTH) + phase) * _WV_BASE_AMP * cy)
-                    y2 = int(cy - math.sin(((x + 1) / _WV_WAVELENGTH) + phase) * _WV_BASE_AMP * cy)
-                    draw.line((x, y1, x + 1, y2), fill=_WV_BASE_COLOR)
+                points = [
+                    (x, int(cy - math.sin((x / _WV_WAVELENGTH) + phase) * _WV_BASE_AMP * cy))
+                    for x in range(WIDTH)
+                ]
+                draw.line(points, fill=_WV_BASE_COLOR)
 
             # Send to display
             try:
@@ -347,18 +340,18 @@ def show_waveform(audio_level):
     Call this repeatedly while speaking to drive the animation.
     The waveform thread handles rendering at ~20 FPS.
     """
-    global _waveform_thread
+    global _waveform_thread, _waveform_level
 
     with _waveform_level_lock:
         _waveform_level = max(0.0, min(float(audio_level), 1.0))
 
-    # Start waveform thread if not running
-    if _waveform_thread is None or not _waveform_thread.is_alive():
-        _waveform_stop.clear()
-        _waveform_thread = threading.Thread(
-            target=_waveform_loop, daemon=True, name="display-waveform"
-        )
-        _waveform_thread.start()
+        # Start waveform thread if not running
+        if _waveform_thread is None or not _waveform_thread.is_alive():
+            _waveform_stop.clear()
+            _waveform_thread = threading.Thread(
+                target=_waveform_loop, daemon=True, name="display-waveform"
+            )
+            _waveform_thread.start()
 
 
 def stop_waveform():

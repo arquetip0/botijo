@@ -93,14 +93,23 @@ TTS playing
 | Module | Init | Threads | Cleanup |
 |--------|------|---------|---------|
 | `config.py` | loads .env + hardware.json + personality | none | none |
-| `audio.py` | ReSpeaker + VAD + STT + TTS clients | monitor thread (during TTS) | releases PyAudio + clients |
-| `brain.py` | OpenAI + Grok clients | none | none |
+| `audio.py` | ReSpeaker + VAD + STT + TTS (shared PyAudio) | monitor thread (during TTS) | releases PyAudio + clients |
+| `brain.py` | OpenAI + Grok clients | none | releases clients + clears history |
 | `personality.py` | loads personality JSON | none | none |
 | `vision.py` | IMX500 + Picamera2 + AI firmware | detection thread | stops camera |
 | `servos.py` | PCA9685 + eye/tentacle setup | eye-idle + tentacle threads | centers + releases |
-| `leds.py` | NeoPixel strip | animation thread | turns off strip |
-| `display.py` | SPI LCD + fonts | none | backlight off |
+| `leds.py` | NeoPixel strip | animation thread (stoppable via _shutdown) | turns off strip |
+| `display.py` | SPI LCD + fonts | waveform thread (lock-protected) | backlight off |
 | `buttons.py` | gpiozero Button x4 | internal gpiozero threads | closes buttons |
+
+## Thread Safety
+
+- `audio.py`: `_interrupt_lock` guards `_is_speaking`/`_interruption_detected`. Shared `_pa` PyAudio instance. ALSA warnings suppressed via ctypes.
+- `brain.py`: `_history_lock` guards conversation history. Tool call messages preserved in history. `_trim_history` respects turn boundaries.
+- `servos.py`: `_quiet` Event for thread-safe quiet mode. `_eye_lock` for eye position.
+- `leds.py`: `_shutdown` Event for clean thread termination. `_lock` for mode changes.
+- `display.py`: `_waveform_level_lock` guards both level updates and thread creation.
+- `main.py`: `PhraseManager` has internal lock. Button sleep via `threading.Event` shared with main loop. `_cleanup_lock` for idempotent shutdown.
 
 ## Graceful Degradation
 

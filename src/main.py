@@ -38,14 +38,16 @@ log = logging.getLogger("botijo")
 # ---------------------------------------------------------------------------
 _modules: list = []
 _cleaned_up = False
+_cleanup_lock = threading.Lock()
 
 
 def _cleanup():
     """Call cleanup() on all initialized modules (idempotent)."""
     global _cleaned_up
-    if _cleaned_up:
-        return
-    _cleaned_up = True
+    with _cleanup_lock:
+        if _cleaned_up:
+            return
+        _cleaned_up = True
     log.info("Shutting down...")
     for mod in reversed(_modules):
         try:
@@ -56,7 +58,6 @@ def _cleanup():
 
 
 def _signal_handler(signum, frame):
-    _cleanup()
     sys.exit(0)
 
 
@@ -69,44 +70,53 @@ class PhraseManager:
 
     Draws from per-category pools and a global pool.  When a pool is
     exhausted it refills from the used-phrase buffer so every phrase
-    gets a turn before any repeats.
+    gets a turn before any repeats.  Thread-safe.
     """
 
     def __init__(self, phrases_dict: dict):
+        self._lock = threading.Lock()
         self._pools = {k: list(v) for k, v in phrases_dict.items()}
         for pool in self._pools.values():
             random.shuffle(pool)
-        # Flat pool of all phrases for any() picks
-        self._all: list[str] = []
+        # Master copy for refilling the global pool
+        self._master: list[str] = []
         for v in phrases_dict.values():
-            self._all.extend(v)
+            self._master.extend(v)
+        # Working global pool
+        self._all: list[str] = list(self._master)
         random.shuffle(self._all)
         # Track used phrases per category for refill
         self._used_by_cat: dict[str, list[str]] = {k: [] for k in phrases_dict}
 
     def any(self) -> str:
         """Return a random phrase from any category (no repeats until pool exhausted)."""
-        if not self._all:
-            for v in self._pools.values():
-                self._all.extend(v)
-            random.shuffle(self._all)
-        return self._all.pop()
+        with self._lock:
+            if not self._all:
+                self._all = list(self._master)
+                random.shuffle(self._all)
+            return self._all.pop()
 
     def from_cat(self, category: str) -> str:
         """Return a random phrase from a specific category, falling back to any()."""
-        pool = self._pools.get(category)
-        if not pool:
-            # Category empty or unknown — refill or fallback
-            used = self._used_by_cat.get(category, [])
-            if used:
-                pool = self._pools[category] = list(used)
-                used.clear()
-                random.shuffle(pool)
-            else:
-                return self.any()
-        choice = pool.pop()
-        self._used_by_cat.setdefault(category, []).append(choice)
-        return choice
+        with self._lock:
+            pool = self._pools.get(category)
+            if not pool:
+                # Category empty or unknown — refill or fallback
+                used = self._used_by_cat.get(category, [])
+                if used:
+                    pool = list(used)
+                    self._pools[category] = pool
+                    self._used_by_cat[category] = []
+                    random.shuffle(pool)
+                else:
+                    # Unknown category — use global pool
+                    if not self._all:
+                        self._all = list(self._master)
+                        random.shuffle(self._all)
+                    return self._all.pop()
+            choice = pool.pop()
+            self._used_by_cat.setdefault(category, []).append(choice)
+            return choice
 
 
 class AutoBanterThread(threading.Thread):
@@ -170,7 +180,7 @@ class FaceBanter:
         now = time.time()
         if now - self.last_time < self.cooldown_s:
             return
-        cat = self.category_sequence[int(now) % len(self.category_sequence)]
+        cat = random.choice(self.category_sequence)
         self.last_time = now
         try:
             text = self.src.from_cat(cat)
@@ -317,7 +327,7 @@ class _FaceTracker(threading.Thread):
 # Main conversational loop (botijo / botija modes)
 # ---------------------------------------------------------------------------
 
-def _run_conversational():
+def _run_conversational(btn_sleep_event=None):
     """Full conversational loop with inactivity timeout and sleep mode."""
     behavior = HARDWARE["behavior"]
     inactivity_timeout = behavior.get("inactivity_timeout", 300)
@@ -337,6 +347,26 @@ def _run_conversational():
         while True:
             now = time.time()
             inactive_secs = now - last_activity
+
+            # --- Button sleep override ---
+            if btn_sleep_event is not None:
+                if btn_sleep_event.is_set() and not sleeping:
+                    log.info("Button triggered sleep mode")
+                    sleeping = True
+                    has_warned = False
+                    servos.set_quiet_mode(True)
+                    leds.set_mode("off")
+                    display.show_eyes("sleepy")
+                    continue
+                elif not btn_sleep_event.is_set() and sleeping:
+                    log.info("Button triggered wake up")
+                    sleeping = False
+                    has_warned = False
+                    last_activity = time.time()
+                    servos.set_quiet_mode(False)
+                    leds.set_mode("steampunk")
+                    display.show_waveform(0.0)
+                    continue
 
             # --- Sleep mode ---
             if sleeping:
@@ -427,7 +457,7 @@ def _run_conversational():
 
 def _run_barbacoa():
     """Barbacoa mode: autonomous phrases + face reactions + conversation."""
-    persona = personality._current or {}
+    persona = personality.get_current()
 
     # Load phrase pools
     phrases_dict = personality.get_phrases()
@@ -534,21 +564,22 @@ def main():
              len([k for k in HARDWARE["buttons"] if k.startswith("btn")]))
 
     # --- Button callbacks ---
-    _sleep_toggle = {"sleeping": False}
+    _btn_sleep = threading.Event()  # set = button requests sleep
 
     def _btn1_toggle_sleep():
         """Toggle between listening and sleep mode."""
-        _sleep_toggle["sleeping"] = not _sleep_toggle["sleeping"]
-        if _sleep_toggle["sleeping"]:
-            log.info("Button 1: entering sleep mode")
-            servos.set_quiet_mode(True)
-            leds.set_mode("off")
-            display.show_eyes("sleepy")
-        else:
+        if _btn_sleep.is_set():
             log.info("Button 1: waking up")
+            _btn_sleep.clear()
             servos.set_quiet_mode(False)
             leds.set_mode("steampunk")
             display.show_waveform(0.0)
+        else:
+            log.info("Button 1: entering sleep mode")
+            _btn_sleep.set()
+            servos.set_quiet_mode(True)
+            leds.set_mode("off")
+            display.show_eyes("sleepy")
 
     def _btn2_reset_history():
         """Reset conversation history."""
@@ -583,7 +614,7 @@ def main():
         if args.mode == "barbacoa":
             _run_barbacoa()
         else:
-            _run_conversational()
+            _run_conversational(btn_sleep_event=_btn_sleep)
     except KeyboardInterrupt:
         pass
     finally:

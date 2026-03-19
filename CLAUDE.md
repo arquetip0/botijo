@@ -15,15 +15,15 @@ Plataforma R&D para producción futura de robots conversacionales.
 | Module | Responsibility |
 |--------|---------------|
 | `config.py` | Load .env + hardware.json + personalities |
-| `audio.py` | ReSpeaker, VAD, STT (Google Cloud), TTS (ElevenLabs + espeak-ng), interruptions |
-| `brain.py` | LLM clients (OpenAI GPT-5, Grok), Perplexity search, conversation history |
+| `audio.py` | ReSpeaker, VAD, STT (Google Cloud), TTS (ElevenLabs + espeak-ng), interruptions, ALSA suppression, shared PyAudio |
+| `brain.py` | LLM clients (OpenAI GPT-5, Grok), Perplexity search, conversation history (with tool call persistence) |
 | `vision.py` | IMX500 face detection, tracking coordinates |
-| `servos.py` | PCA9685 servos — eyes, eyelids, tentacles, ears, quiet_mode |
-| `leds.py` | NeoPixel animations (steampunk, listening, speaking) |
-| `display.py` | Waveshare 1.9" LCD — eye expressions, waveform visualizer |
+| `servos.py` | PCA9685 servos — eyes, eyelids, tentacles, ears, quiet_mode (thread-safe Event) |
+| `leds.py` | NeoPixel animations (steampunk, listening, speaking), clean shutdown via _shutdown Event |
+| `display.py` | Waveshare 1.9" LCD — eye expressions, waveform visualizer (polyline, lock-protected thread) |
 | `buttons.py` | GPIO buttons with callbacks |
-| `personality.py` | System prompts, tool definitions, phrase pools |
-| `main.py` | Orchestrator: parse args, init modules, main loop |
+| `personality.py` | System prompts, tool definitions, phrase pools, `get_current()` accessor |
+| `main.py` | Orchestrator: parse args, init modules, main loop, thread-safe PhraseManager, button↔loop sleep sync |
 
 ## Hardware
 

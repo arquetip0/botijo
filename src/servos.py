@@ -35,7 +35,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 _kit = None                     # ServoKit instance (or None)
 _shutdown = threading.Event()   # signal threads to stop
-_quiet_mode = False             # pause mechanical movements while mic is active
+_quiet = threading.Event()      # set = quiet mode ON (pause mechanical movements)
 _initialized = False
 
 _eye_thread = None
@@ -306,7 +306,7 @@ def _stop_tentacles():
 def _eye_idle_loop():
     """Idle eye behavior: blinks, saccades, micro-movements, breathing.
 
-    Runs until _shutdown is set. Pauses all movement when _quiet_mode is True
+    Runs until _shutdown is set. Pauses all movement when _quiet is set
     (blinks, squints, and random looks are suppressed).
     """
     log.info("Eye idle thread started")
@@ -319,7 +319,7 @@ def _eye_idle_loop():
                 _update_eyelids_breathing()
                 last_breathing = time.time()
 
-            if not _quiet_mode:
+            if not _quiet.is_set():
                 # Random behaviors
                 r = random.random()
                 if r < _EYES.get("blink_probability", 0.01):
@@ -344,7 +344,7 @@ def _eye_idle_loop():
 def _tentacle_loop():
     """Random tentacle movement with mirrored left/right.
 
-    Runs until _shutdown is set. Pauses when _quiet_mode is True.
+    Runs until _shutdown is set. Pauses when _quiet is set.
     """
     log.info("Tentacle thread started")
     angle_left = 90
@@ -353,7 +353,7 @@ def _tentacle_loop():
     while not _shutdown.is_set():
         try:
             # Wait while in quiet mode (check every 100ms)
-            if _quiet_mode:
+            if _quiet.is_set():
                 _shutdown.wait(0.1)
                 continue
 
@@ -379,20 +379,24 @@ def _tentacle_loop():
                 rng_right = range(angle_right, target_right - 1, -step)
 
             # Move both in parallel steps
+            actual_left = angle_left
+            actual_right = angle_right
             for a_left, a_right in zip(rng_left, rng_right):
-                if _shutdown.is_set() or _quiet_mode:
+                if _shutdown.is_set() or _quiet.is_set():
                     break
                 _set_angle(_CH_TENT_L, a_left)
                 _set_angle(_CH_TENT_R, a_right)
+                actual_left = a_left
+                actual_right = a_right
                 time.sleep(random.uniform(0.005, 0.015))
 
-            angle_left = target_left
-            angle_right = target_right
+            angle_left = actual_left
+            angle_right = actual_right
 
             # Random pause 3-6s (check exit every 100ms)
             pause = random.uniform(3, 6)
             for _ in range(int(pause * 10)):
-                if _shutdown.is_set() or _quiet_mode:
+                if _shutdown.is_set() or _quiet.is_set():
                     break
                 time.sleep(0.1)
 
@@ -495,14 +499,14 @@ def set_quiet_mode(on):
     - Eye idle thread suppresses blinks/saccades/squints (breathing continues)
     - Tentacle thread pauses movement
     """
-    global _quiet_mode
-    if on == _quiet_mode:
-        return
-    _quiet_mode = on
     if on:
-        log.debug("Quiet mode ON — mechanical movements paused")
+        if not _quiet.is_set():
+            _quiet.set()
+            log.debug("Quiet mode ON — mechanical movements paused")
     else:
-        log.debug("Quiet mode OFF — movements resumed")
+        if _quiet.is_set():
+            _quiet.clear()
+            log.debug("Quiet mode OFF — movements resumed")
 
 
 def cleanup():

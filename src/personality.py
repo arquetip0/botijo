@@ -16,6 +16,11 @@ def load(name: str) -> dict:
     return _current
 
 
+def get_current() -> dict:
+    """Return the current personality config dict, or empty dict if none loaded."""
+    return _current or {}
+
+
 def get_system_prompt() -> str:
     if not _current:
         raise RuntimeError("No personality loaded")

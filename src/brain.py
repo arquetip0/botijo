@@ -109,6 +109,12 @@ def chat_stream(user_text: str) -> Generator[str, None, None]:
         # Resolve tool calls if any
         if tool_calls_buffer:
             _handle_tool_calls(tool_calls_buffer, messages)
+            # Save tool-related messages to history
+            with _history_lock:
+                # Add tool call assistant message + tool results
+                for msg in messages[len(_history):]:
+                    _history.append(msg)
+
             for chunk_text in _continue_after_tools(messages):
                 full_response += chunk_text
                 yield chunk_text
@@ -119,6 +125,7 @@ def chat_stream(user_text: str) -> Generator[str, None, None]:
         full_response = error_msg
         yield error_msg
 
+    # Always append assistant response eagerly
     with _history_lock:
         _history.append({"role": "assistant", "content": full_response})
 
@@ -158,13 +165,32 @@ def reset_history() -> None:
 
 
 def cleanup():
-    pass
+    """Release LLM clients and clear history."""
+    global _client, _px_client
+    _client = None
+    _px_client = None
+    with _history_lock:
+        _history.clear()
 
 
 def _trim_history():
-    if len(_history) > _max_history + 1:
-        system = _history[0]
-        _history[:] = [system] + _history[-_max_history:]
+    """Trim history while preserving complete turns (no orphaned tool messages)."""
+    if len(_history) <= _max_history + 1:
+        return
+    system = _history[0]
+    recent = _history[-_max_history:]
+    # Walk forward to find first complete turn boundary
+    # Skip any orphaned tool/tool_calls messages at the start
+    start = 0
+    while start < len(recent):
+        msg = recent[start]
+        if msg["role"] == "tool":
+            start += 1  # Skip orphaned tool result
+        elif msg["role"] == "assistant" and msg.get("tool_calls"):
+            start += 1  # Skip orphaned tool-calling assistant message
+        else:
+            break
+    _history[:] = [system] + recent[start:]
 
 
 def _handle_tool_calls(tool_calls_buffer: dict, messages: list) -> bool:
@@ -208,6 +234,7 @@ def _continue_after_tools(messages: list) -> Generator[str, None, None]:
         "messages": messages,
         "max_completion_tokens": _llm_config["max_completion_tokens"],
         "stream": True,
+        "tool_choice": "none",  # Prevent recursive tool calls
     }
     model_name = _llm_config["model"].lower()
     if not model_name.startswith("gpt-5"):
