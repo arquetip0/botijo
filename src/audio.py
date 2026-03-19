@@ -83,6 +83,7 @@ _echo_buffer = collections.deque(maxlen=HARDWARE["vad"]["echo_buffer_maxlen"])
 _monitor_thread = None              # daemon thread for interruption monitor
 _speech_client = None               # Google Cloud Speech client
 _eleven_client = None               # ElevenLabs client
+_on_audio_level = None              # optional callback(float) for waveform display
 
 # Convenience aliases from config
 _RS = HARDWARE["respeaker"]
@@ -650,6 +651,15 @@ def _speak_elevenlabs_sentence(pa_stream, text):
             # Add to echo buffer for cancellation
             _add_echo(audio_chunk)
 
+            # Push RMS level to waveform callback
+            if _on_audio_level is not None:
+                try:
+                    samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32)
+                    rms = float(np.sqrt(np.mean(samples ** 2))) / 32768.0
+                    _on_audio_level(min(1.0, rms * 3.0))  # amplify for visibility
+                except Exception:
+                    pass
+
             pa_stream.write(audio_chunk)
 
             # Post-write check
@@ -739,6 +749,13 @@ def _speak_elevenlabs(chunks):
     finally:
         _stop_monitor()
 
+        # Reset audio level so waveform decays
+        if _on_audio_level is not None:
+            try:
+                _on_audio_level(0.0)
+            except Exception:
+                pass
+
         with _interrupt_lock:
             _is_speaking = False
             _interruption_detected = False
@@ -806,6 +823,15 @@ def speak_stream(chunks) -> SpeakResult:
 # ---------------------------------------------------------------------------
 # 6. Public helpers
 # ---------------------------------------------------------------------------
+
+def set_audio_level_callback(callback):
+    """Set a callback that receives RMS audio level (0.0-1.0) during TTS playback.
+
+    Used by main.py to drive the display waveform visualizer.
+    """
+    global _on_audio_level
+    _on_audio_level = callback
+
 
 def is_voice_detected() -> bool:
     """Check if a voice interruption has been detected (thread-safe)."""

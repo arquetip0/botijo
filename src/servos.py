@@ -467,9 +467,9 @@ def look_at(x, y):
     if _kit is None:
         return
 
-    # Map normalized coords to servo ranges
-    lr = _LR_MIN + x * (_LR_MAX - _LR_MIN)
-    ud = _UD_MIN + y * (_UD_MAX - _UD_MIN)
+    # Map normalized coords to servo ranges (inverted — camera image is mirrored)
+    lr = _LR_MAX - x * (_LR_MAX - _LR_MIN)
+    ud = _UD_MAX - y * (_UD_MAX - _UD_MIN)
 
     # Clamp
     lr = max(_LR_MIN, min(_LR_MAX, lr))

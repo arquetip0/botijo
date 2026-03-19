@@ -63,10 +63,13 @@ def chat_stream(user_text: str) -> Generator[str, None, None]:
     kwargs = {
         "model": _llm_config["model"],
         "messages": messages,
-        "temperature": _llm_config["temperature"],
         "max_completion_tokens": _llm_config["max_completion_tokens"],
         "stream": True,
     }
+    # GPT-5 only supports temperature=1 (the default) — omit for those models
+    model_name = _llm_config["model"].lower()
+    if not model_name.startswith("gpt-5"):
+        kwargs["temperature"] = _llm_config["temperature"]
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
@@ -203,10 +206,12 @@ def _continue_after_tools(messages: list) -> Generator[str, None, None]:
     kwargs = {
         "model": _llm_config["model"],
         "messages": messages,
-        "temperature": _llm_config["temperature"],
         "max_completion_tokens": _llm_config["max_completion_tokens"],
         "stream": True,
     }
+    model_name = _llm_config["model"].lower()
+    if not model_name.startswith("gpt-5"):
+        kwargs["temperature"] = _llm_config["temperature"]
     try:
         stream = _client.chat.completions.create(**kwargs)
         for chunk in stream:

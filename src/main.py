@@ -571,6 +571,9 @@ def main():
     _init_modules(args.mode)
     _init_buttons(button_callbacks)
 
+    # --- Wire audio → display waveform callback ---
+    audio.set_audio_level_callback(display.show_waveform)
+
     # --- Speak greeting ---
     greeting = personality.get_greeting()
     log.info("Greeting: %s", greeting)
