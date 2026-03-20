@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -67,7 +68,7 @@ logging.getLogger("picamera2").setLevel(logging.WARNING)
 # Audio config
 # ---------------------------------------------------------------------------
 MIC_SAMPLE_RATE = 16000  # ReSpeaker native rate
-PLAYBACK_SAMPLE_RATE = 48000  # ReSpeaker UAC1.0 only supports 48kHz output natively
+PLAYBACK_SAMPLE_RATE = 24000  # Matches audio.py and hardware.json
 NUM_CHANNELS = 1
 MIC_FRAME_DURATION_MS = 20
 MIC_SAMPLES_PER_FRAME = MIC_SAMPLE_RATE * MIC_FRAME_DURATION_MS // 1000
@@ -105,6 +106,29 @@ def _cleanup():
         except Exception as e:
             log.warning("Cleanup error in %s: %s", mod.__name__, e)
     log.info("Goodbye.")
+
+
+# ---------------------------------------------------------------------------
+# ReSpeaker hardware init (mic gain + AGC + NS — same as audio.py)
+# ---------------------------------------------------------------------------
+
+MIC_DIGITAL_GAIN = int(os.getenv("MIC_DIGITAL_GAIN", "3"))  # x3 default
+
+def _init_respeaker_audio():
+    """Initialize ReSpeaker hardware settings (same as audio.py)."""
+    commands = [
+        "amixer -D pulse sset 'Mic' 80%",
+        "amixer -D pulse sset 'Auto Gain Control' on",
+        "amixer -D pulse sset 'Noise Suppression' on",
+    ]
+    for cmd in commands:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            log.info("amixer OK: %s", cmd.split("sset ")[1])
+        else:
+            log.warning("amixer failed: %s → %s", cmd, result.stderr.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +246,7 @@ async def capture_microphone(
 
     frame_q: queue_mod.Queue = queue_mod.Queue(maxsize=50)
     frame_count = [0]
+    consumer_count = [0]
     _silence_frame = np.zeros(MIC_SAMPLES_PER_FRAME, dtype=np.int16).tobytes()
 
     def audio_callback(indata, frames, time_info, status):
@@ -260,8 +285,19 @@ async def capture_microphone(
             try:
                 # Non-blocking check with small timeout to stay responsive
                 data = await loop.run_in_executor(None, lambda: frame_q.get(timeout=0.1))
+                # Digital gain + periodic RMS logging
+                frame_data = np.frombuffer(data, dtype=np.int16)
+                if MIC_DIGITAL_GAIN > 1:
+                    frame_data = np.clip(
+                        frame_data.astype(np.int32) * MIC_DIGITAL_GAIN, -32768, 32767
+                    ).astype(np.int16)
+                consumer_count[0] += 1
+                if consumer_count[0] % 250 == 0:  # every ~5s
+                    rms = np.sqrt(np.mean(frame_data.astype(np.float32) ** 2))
+                    log.info("Mic RMS (post-gain x%d): %.0f (%.1f%% FS)",
+                             MIC_DIGITAL_GAIN, rms, rms / 32768 * 100)
                 frame = rtc.AudioFrame(
-                    data=data,
+                    data=frame_data.tobytes(),
                     sample_rate=MIC_SAMPLE_RATE,
                     num_channels=NUM_CHANNELS,
                     samples_per_channel=MIC_SAMPLES_PER_FRAME,
@@ -299,7 +335,7 @@ async def play_audio_track(
         channels=NUM_CHANNELS,
         rate=PLAYBACK_SAMPLE_RATE,
         output=True,
-        frames_per_buffer=4096,  # Larger buffer for RPi stability (avoid underruns)
+        frames_per_buffer=1024,  # Match audio.py buffer size at 24kHz
     )
     log.info("PyAudio output stream opened (rate=%d)", PLAYBACK_SAMPLE_RATE)
 
@@ -556,6 +592,9 @@ def main():
 
     # Init hardware (no audio/brain)
     _init_hardware()
+
+    # Init ReSpeaker hardware (mic gain, AGC, NS — same as audio.py)
+    _init_respeaker_audio()
 
     # Find ReSpeaker for mic input (output via PyAudio default — PulseAudio)
     input_device = _find_respeaker_input()
