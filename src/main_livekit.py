@@ -20,9 +20,31 @@ import sys
 import threading
 import time
 
+import queue as queue_mod
+
 import numpy as np
 import sounddevice as sd
 from livekit import api, rtc
+
+# Suppress ALSA warnings (same pattern as audio.py)
+import ctypes
+try:
+    _ERROR_HANDLER_FUNC = ctypes.CFUNCTYPE(
+        None, ctypes.c_char_p, ctypes.c_int,
+        ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+    )
+    def _py_error_handler(filename, line, function, err, fmt):
+        pass
+    _c_error_handler = _ERROR_HANDLER_FUNC(_py_error_handler)
+    _asound = ctypes.cdll.LoadLibrary('libasound.so.2')
+    _asound.snd_lib_error_set_handler(_c_error_handler)
+except OSError:
+    pass
+
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
 
 from config import HARDWARE
 import buttons
@@ -42,7 +64,7 @@ log = logging.getLogger("botijo-lk")
 # Audio config
 # ---------------------------------------------------------------------------
 MIC_SAMPLE_RATE = 16000  # ReSpeaker native rate
-PLAYBACK_SAMPLE_RATE = 48000
+PLAYBACK_SAMPLE_RATE = 24000  # Match Cartesia TTS; PyAudio/PulseAudio resamples for ReSpeaker
 NUM_CHANNELS = 1
 MIC_FRAME_DURATION_MS = 20
 MIC_SAMPLES_PER_FRAME = MIC_SAMPLE_RATE * MIC_FRAME_DURATION_MS // 1000
@@ -86,28 +108,17 @@ def _cleanup():
 # Device discovery
 # ---------------------------------------------------------------------------
 
-def _find_respeaker_device():
-    """Find ReSpeaker input and output device indices."""
-    input_idx = None
-    output_idx = None
+def _find_respeaker_input():
+    """Find ReSpeaker input device index for sounddevice mic capture."""
     devices = sd.query_devices()
-
     for i, dev in enumerate(devices):
         name = dev["name"].lower()
         if any(k in name for k in ("respeaker", "seeed", "mic array")):
-            if dev["max_input_channels"] > 0 and input_idx is None:
-                input_idx = i
+            if dev["max_input_channels"] > 0:
                 log.info("ReSpeaker input: [%d] %s", i, dev["name"])
-            if dev["max_output_channels"] > 0 and output_idx is None:
-                output_idx = i
-                log.info("ReSpeaker output: [%d] %s", i, dev["name"])
-
-    if input_idx is None:
-        log.warning("ReSpeaker not found — using default input device")
-    if output_idx is None:
-        log.warning("ReSpeaker output not found — using default output device")
-
-    return input_idx, output_idx
+                return i
+    log.warning("ReSpeaker not found — using default input device")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +154,12 @@ class AgentStateTracker:
             if not self.is_speaking:
                 self.is_speaking = True
                 leds.set_mode("speaking")
-                servos.set_quiet_mode(True)
             display.show_waveform(level)
         else:
             self._silence_count += 1
             if self._silence_count > SILENCE_FRAMES_THRESHOLD and self.is_speaking:
                 self.is_speaking = False
                 leds.set_mode("steampunk")
-                servos.set_quiet_mode(False)
                 display.show_waveform(0.0)
 
     @property
@@ -204,23 +213,24 @@ async def capture_microphone(
     sleep_ctrl: SleepController,
     input_device: int | None,
 ):
-    loop = asyncio.get_running_loop()
+    """Capture mic via callback → queue → async consumer for steady frame rate."""
+    log.info("Starting mic capture (rate=%d, device=%s)", MIC_SAMPLE_RATE, input_device)
+
+    frame_q: queue_mod.Queue = queue_mod.Queue(maxsize=50)
+    frame_count = [0]
 
     def audio_callback(indata, frames, time_info, status):
-        if status:
-            log.warning("Mic status: %s", status)
         if not sleep_ctrl.should_capture:
             return
         audio_int16 = (indata[:, 0] * 32767).astype(np.int16)
-        frame = rtc.AudioFrame(
-            data=audio_int16.tobytes(),
-            sample_rate=MIC_SAMPLE_RATE,
-            num_channels=NUM_CHANNELS,
-            samples_per_channel=len(audio_int16),
-        )
-        asyncio.run_coroutine_threadsafe(source.capture_frame(frame), loop)
-
-    log.info("Starting mic capture (rate=%d, device=%s)", MIC_SAMPLE_RATE, input_device)
+        frame_count[0] += 1
+        if frame_count[0] <= 3 or frame_count[0] % 500 == 0:
+            rms = np.sqrt(np.mean(audio_int16.astype(np.float32) ** 2))
+            log.info("Mic frame #%d: %d samples, rms=%.0f", frame_count[0], len(audio_int16), rms)
+        try:
+            frame_q.put_nowait(audio_int16.tobytes())
+        except queue_mod.Full:
+            pass  # drop frame if consumer is behind
 
     stream = sd.InputStream(
         device=input_device,
@@ -231,10 +241,23 @@ async def capture_microphone(
         callback=audio_callback,
     )
 
+    loop = asyncio.get_running_loop()
     with stream:
-        await stop_event.wait()
+        while not stop_event.is_set():
+            try:
+                # Non-blocking check with small timeout to stay responsive
+                data = await loop.run_in_executor(None, lambda: frame_q.get(timeout=0.1))
+                frame = rtc.AudioFrame(
+                    data=data,
+                    sample_rate=MIC_SAMPLE_RATE,
+                    num_channels=NUM_CHANNELS,
+                    samples_per_channel=MIC_SAMPLES_PER_FRAME,
+                )
+                await source.capture_frame(frame)
+            except queue_mod.Empty:
+                continue
 
-    log.info("Mic capture stopped")
+    log.info("Mic capture stopped (captured %d frames)", frame_count[0])
 
 
 # ---------------------------------------------------------------------------
@@ -245,34 +268,47 @@ async def play_audio_track(
     track: rtc.RemoteAudioTrack,
     stop_event: asyncio.Event,
     state_tracker: AgentStateTracker,
-    output_device: int | None,
 ):
     log.info("Playing audio track: %s", track.sid)
 
-    stream = sd.OutputStream(
-        device=output_device,
-        samplerate=PLAYBACK_SAMPLE_RATE,
+    if pyaudio is None:
+        log.error("PyAudio not available — cannot play audio")
+        return
+
+    pa = pyaudio.PyAudio()
+    pa_stream = pa.open(
+        format=pyaudio.paInt16,
         channels=NUM_CHANNELS,
-        dtype="int16",
+        rate=PLAYBACK_SAMPLE_RATE,
+        output=True,
+        frames_per_buffer=1024,
     )
-    stream.start()
+    log.info("PyAudio output stream opened (rate=%d)", PLAYBACK_SAMPLE_RATE)
 
     audio_stream = rtc.AudioStream(
         track, sample_rate=PLAYBACK_SAMPLE_RATE, num_channels=NUM_CHANNELS
     )
+    frame_count = 0
     try:
         async for event in audio_stream:
             if stop_event.is_set():
                 break
             frame = event.frame
             audio_data = np.frombuffer(frame.data, dtype=np.int16)
+            frame_count += 1
+            if frame_count == 1:
+                log.info("First audio frame received: %d samples, rms=%.0f",
+                         len(audio_data), np.sqrt(np.mean(audio_data.astype(np.float32) ** 2)))
+            elif frame_count % 500 == 0:
+                log.debug("Audio frames played: %d", frame_count)
             state_tracker.process_frame(audio_data)
-            stream.write(audio_data.reshape(-1, NUM_CHANNELS))
+            pa_stream.write(audio_data.tobytes())
     except Exception:
         log.exception("Audio playback error")
     finally:
-        stream.stop()
-        stream.close()
+        pa_stream.stop_stream()
+        pa_stream.close()
+        pa.terminate()
         log.info("Audio playback stopped")
 
 
@@ -329,7 +365,6 @@ async def run_client(
     participant_name: str,
     sleep_ctrl: SleepController,
     input_device: int | None,
-    output_device: int | None,
 ):
     state_tracker = AgentStateTracker()
     reconnect_delay = INITIAL_RECONNECT_DELAY
@@ -361,7 +396,7 @@ async def run_client(
                 if isinstance(track, rtc.RemoteAudioTrack):
                     log.info("Subscribed to audio from %s", participant.identity)
                     task = asyncio.create_task(
-                        play_audio_track(track, stop_event, state_tracker, output_device)
+                        play_audio_track(track, stop_event, state_tracker)
                     )
                     tasks.append(task)
 
@@ -371,13 +406,14 @@ async def run_client(
 
             reconnect_delay = INITIAL_RECONNECT_DELAY
 
-            # Publish microphone
+            # Publish microphone (source=MICROPHONE so agent STT picks it up)
             source = rtc.AudioSource(
                 sample_rate=MIC_SAMPLE_RATE, num_channels=NUM_CHANNELS
             )
             mic_track = rtc.LocalAudioTrack.create_audio_track("mic", source)
-            await room.local_participant.publish_track(mic_track)
-            log.info("Mic track published")
+            options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+            await room.local_participant.publish_track(mic_track, options)
+            log.info("Mic track published (source=MICROPHONE)")
 
             # Start capture + inactivity monitor
             mic_task = asyncio.create_task(
@@ -411,6 +447,10 @@ async def run_client(
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await room.disconnect()
+            except Exception:
+                pass
 
         log.info("Reconnecting in %.0fs...", reconnect_delay)
         await asyncio.sleep(reconnect_delay)
@@ -461,8 +501,8 @@ def main():
     # Init hardware (no audio/brain)
     _init_hardware()
 
-    # Find ReSpeaker devices
-    input_device, output_device = _find_respeaker_device()
+    # Find ReSpeaker for mic input (output via PyAudio default — PulseAudio)
+    input_device = _find_respeaker_input()
 
     # Sleep controller
     sleep_ctrl = SleepController()
@@ -489,7 +529,8 @@ def main():
     face_tracker = _FaceTracker()
     face_tracker.start()
 
-    # Initial state
+    # Initial state — quiet mode keeps tentacles/eyelids still, face tracker moves eyes
+    servos.set_quiet_mode(True)
     leds.set_mode("steampunk")
     display.show_waveform(0.0)
 
@@ -507,7 +548,7 @@ def main():
     task = loop.create_task(
         run_client(
             args.url, api_key, api_secret, args.room, args.name,
-            sleep_ctrl, input_device, output_device,
+            sleep_ctrl, input_device,
         )
     )
 
