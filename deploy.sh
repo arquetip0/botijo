@@ -12,6 +12,7 @@ rsync -avz --delete src/ "$REMOTE:$REMOTE_DIR/src/"
 rsync -avz --delete config/ "$REMOTE:$REMOTE_DIR/config/"
 rsync -avz --delete tools/ "$REMOTE:$REMOTE_DIR/tools/"
 rsync -avz --delete vendor/ "$REMOTE:$REMOTE_DIR/vendor/"
+rsync -avz --delete --copy-links old/ "$REMOTE:$REMOTE_DIR/old/"
 rsync -avz requirements.txt "$REMOTE:$REMOTE_DIR/" 2>/dev/null || true
 rsync -avz run_livekit.py "$REMOTE:$REMOTE_DIR/"
 
