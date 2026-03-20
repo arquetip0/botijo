@@ -1,28 +1,33 @@
-"""Botijo — Androide Conversacional.
+"""Botijo — LiveKit Client.
 
-Entry point. Parses args, loads config, initializes modules, runs main loop.
-Supports two modes:
-  - botijo/botija: full conversational loop with inactivity timeout
-  - barbacoa: autonomous phrase emission + face reactions + conversation
+Connects to lk.nestorcyborg.com via LiveKit, streams ReSpeaker mic audio
+to the server agent (Deepgram STT + nanoclone/MCP + Cartesia TTS) and plays
+back received audio. All hardware (servos, LEDs, display, vision, buttons)
+runs locally; audio processing is server-side.
 
-Usage: PYTHONPATH=src:vendor python src/main.py [--mode botijo|botija|barbacoa]
+Usage: PYTHONPATH=src:vendor python src/main_livekit.py [--room botijo] [--debug]
 """
 
+from __future__ import annotations
+
 import argparse
+import asyncio
 import logging
-import random
+import os
 import signal
+import socket
 import sys
 import threading
 import time
 
+import numpy as np
+import sounddevice as sd
+from livekit import api, rtc
+
 from config import HARDWARE
-import audio
-import brain
 import buttons
 import display
 import leds
-import personality
 import servos
 import vision
 
@@ -31,10 +36,31 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("botijo")
+log = logging.getLogger("botijo-lk")
 
 # ---------------------------------------------------------------------------
-# Module tracking
+# Audio config
+# ---------------------------------------------------------------------------
+MIC_SAMPLE_RATE = 16000  # ReSpeaker native rate
+PLAYBACK_SAMPLE_RATE = 48000
+NUM_CHANNELS = 1
+MIC_FRAME_DURATION_MS = 20
+MIC_SAMPLES_PER_FRAME = MIC_SAMPLE_RATE * MIC_FRAME_DURATION_MS // 1000
+
+# Reconnection
+INITIAL_RECONNECT_DELAY = 1.0
+MAX_RECONNECT_DELAY = 60.0
+RECONNECT_BACKOFF = 2.0
+
+# Agent state detection
+RMS_SPEAKING_THRESHOLD = 300  # int16 RMS above this = agent speaking
+SILENCE_FRAMES_THRESHOLD = 15  # ~300ms at 20ms frames
+
+# Inactivity
+INACTIVITY_TIMEOUT = HARDWARE["behavior"].get("inactivity_timeout", 300)
+
+# ---------------------------------------------------------------------------
+# Module tracking (for cleanup)
 # ---------------------------------------------------------------------------
 _modules: list = []
 _cleaned_up = False
@@ -42,7 +68,6 @@ _cleanup_lock = threading.Lock()
 
 
 def _cleanup():
-    """Call cleanup() on all initialized modules (idempotent)."""
     global _cleaned_up
     with _cleanup_lock:
         if _cleaned_up:
@@ -57,259 +82,223 @@ def _cleanup():
     log.info("Goodbye.")
 
 
-def _signal_handler(signum, frame):
-    sys.exit(0)
+# ---------------------------------------------------------------------------
+# Device discovery
+# ---------------------------------------------------------------------------
+
+def _find_respeaker_device():
+    """Find ReSpeaker input and output device indices."""
+    input_idx = None
+    output_idx = None
+    devices = sd.query_devices()
+
+    for i, dev in enumerate(devices):
+        name = dev["name"].lower()
+        if any(k in name for k in ("respeaker", "seeed", "mic array")):
+            if dev["max_input_channels"] > 0 and input_idx is None:
+                input_idx = i
+                log.info("ReSpeaker input: [%d] %s", i, dev["name"])
+            if dev["max_output_channels"] > 0 and output_idx is None:
+                output_idx = i
+                log.info("ReSpeaker output: [%d] %s", i, dev["name"])
+
+    if input_idx is None:
+        log.warning("ReSpeaker not found — using default input device")
+    if output_idx is None:
+        log.warning("ReSpeaker output not found — using default output device")
+
+    return input_idx, output_idx
 
 
 # ---------------------------------------------------------------------------
-# Barbacoa mode helpers
+# Token generation
 # ---------------------------------------------------------------------------
 
-class PhraseManager:
-    """Manages phrase pools with no-repeat guarantee.
+def generate_token(api_key: str, api_secret: str, room_name: str, identity: str) -> str:
+    token = (
+        api.AccessToken(api_key, api_secret)
+        .with_identity(identity)
+        .with_grants(api.VideoGrants(room_join=True, room=room_name))
+    )
+    return token.to_jwt()
 
-    Draws from per-category pools and a global pool.  When a pool is
-    exhausted it refills from the used-phrase buffer so every phrase
-    gets a turn before any repeats.  Thread-safe.
-    """
 
-    def __init__(self, phrases_dict: dict):
+# ---------------------------------------------------------------------------
+# Agent state tracker — detects if server agent is speaking
+# ---------------------------------------------------------------------------
+
+class AgentStateTracker:
+    def __init__(self):
+        self.is_speaking = False
+        self.last_activity = time.time()
+        self._silence_count = 0
+
+    def process_frame(self, audio_data: np.ndarray):
+        rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
+        level = min(rms / 10000.0, 1.0)  # Normalize for display
+
+        if rms > RMS_SPEAKING_THRESHOLD:
+            self._silence_count = 0
+            self.last_activity = time.time()
+            if not self.is_speaking:
+                self.is_speaking = True
+                leds.set_mode("speaking")
+                servos.set_quiet_mode(True)
+            display.show_waveform(level)
+        else:
+            self._silence_count += 1
+            if self._silence_count > SILENCE_FRAMES_THRESHOLD and self.is_speaking:
+                self.is_speaking = False
+                leds.set_mode("steampunk")
+                servos.set_quiet_mode(False)
+                display.show_waveform(0.0)
+
+    @property
+    def inactive_seconds(self) -> float:
+        return time.time() - self.last_activity
+
+
+# ---------------------------------------------------------------------------
+# Sleep controller
+# ---------------------------------------------------------------------------
+
+class SleepController:
+    def __init__(self):
+        self._mic_muted = False
         self._lock = threading.Lock()
-        self._pools = {k: list(v) for k, v in phrases_dict.items()}
-        for pool in self._pools.values():
-            random.shuffle(pool)
-        # Master copy for refilling the global pool
-        self._master: list[str] = []
-        for v in phrases_dict.values():
-            self._master.extend(v)
-        # Working global pool
-        self._all: list[str] = list(self._master)
-        random.shuffle(self._all)
-        # Track used phrases per category for refill
-        self._used_by_cat: dict[str, list[str]] = {k: [] for k in phrases_dict}
 
-    def any(self) -> str:
-        """Return a random phrase from any category (no repeats until pool exhausted)."""
+    @property
+    def should_capture(self) -> bool:
         with self._lock:
-            if not self._all:
-                self._all = list(self._master)
-                random.shuffle(self._all)
-            return self._all.pop()
+            return not self._mic_muted
 
-    def from_cat(self, category: str) -> str:
-        """Return a random phrase from a specific category, falling back to any()."""
+    def enter_sleep(self):
         with self._lock:
-            pool = self._pools.get(category)
-            if not pool:
-                # Category empty or unknown — refill or fallback
-                used = self._used_by_cat.get(category, [])
-                if used:
-                    pool = list(used)
-                    self._pools[category] = pool
-                    self._used_by_cat[category] = []
-                    random.shuffle(pool)
-                else:
-                    # Unknown category — use global pool
-                    if not self._all:
-                        self._all = list(self._master)
-                        random.shuffle(self._all)
-                    return self._all.pop()
-            choice = pool.pop()
-            self._used_by_cat.setdefault(category, []).append(choice)
-            return choice
+            self._mic_muted = True
+        log.info("Entering sleep mode")
+        leds.set_mode("off")
+        display.show_eyes("sleepy")
+        servos.set_quiet_mode(True)
 
+    def wake_up(self):
+        with self._lock:
+            self._mic_muted = False
+        log.info("Waking up")
+        leds.set_mode("steampunk")
+        display.show_waveform(0.0)
+        servos.set_quiet_mode(False)
 
-class AutoBanterThread(threading.Thread):
-    """Daemon thread that speaks a random phrase every min_s..max_s seconds."""
-
-    def __init__(self, speaker, phrase_source, min_s=120, max_s=240,
-                 consult_is_speaking=None, preferred_cats=None):
-        super().__init__(daemon=True)
-        self.speaker = speaker
-        self.src = phrase_source
-        self.min_s = min_s
-        self.max_s = max_s
-        self.consult_is_speaking = consult_is_speaking or (lambda: False)
-        self.preferred_cats = preferred_cats or []
-        self.stop_event = threading.Event()
-
-    def stop(self):
-        self.stop_event.set()
-
-    def run(self):
-        while not self.stop_event.is_set():
-            wait = random.randint(self.min_s, self.max_s)
-            # Sleep in small increments so stop_event is responsive
-            for _ in range(wait * 10):
-                if self.stop_event.is_set():
-                    return
-                time.sleep(0.1)
-            if self.consult_is_speaking():
-                continue
-            try:
-                if self.preferred_cats:
-                    cat = random.choice(self.preferred_cats)
-                    text = self.src.from_cat(cat)
-                else:
-                    text = self.src.any()
-                log.info("[AUTOBANTER] Speaking: %s", text[:60])
-                self.speaker(text)
-            except Exception as e:
-                log.warning("[AUTOBANTER] Error: %s", e)
-
-
-class FaceBanter:
-    """Reacts to detected faces by speaking a phrase (with cooldown)."""
-
-    def __init__(self, speaker, phrase_source, cooldown_s=35,
-                 category_sequence=None, consult_is_speaking=None):
-        self.speaker = speaker
-        self.src = phrase_source
-        self.cooldown_s = cooldown_s
-        self.last_time = 0.0
-        self.consult_is_speaking = consult_is_speaking or (lambda: False)
-        self.category_sequence = category_sequence or [
-            "ninos_humor_blanco", "fuego_barbacoa",
-            "aristocracia_culta", "interaccion_directa",
-        ]
-
-    def maybe_emit(self):
-        """Check cooldown and emit a phrase if enough time has passed."""
-        if self.consult_is_speaking():
-            return
-        now = time.time()
-        if now - self.last_time < self.cooldown_s:
-            return
-        cat = random.choice(self.category_sequence)
-        self.last_time = now
-        try:
-            text = self.src.from_cat(cat)
-            log.info("[FACEBANTER] Speaking: %s", text[:60])
-            self.speaker(text)
-        except Exception as e:
-            log.warning("[FACEBANTER] Error: %s", e)
+    @property
+    def is_sleeping(self) -> bool:
+        with self._lock:
+            return self._mic_muted
 
 
 # ---------------------------------------------------------------------------
-# Initialization helpers
+# Microphone capture
 # ---------------------------------------------------------------------------
 
-def _init_modules(mode: str) -> None:
-    """Initialize all hardware modules with graceful degradation.
+async def capture_microphone(
+    source: rtc.AudioSource,
+    stop_event: asyncio.Event,
+    sleep_ctrl: SleepController,
+    input_device: int | None,
+):
+    loop = asyncio.get_running_loop()
 
-    Each module can fail independently — the system continues with
-    whatever hardware is available.
-    """
-    # Brain first (loads personality + LLM clients)
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            log.warning("Mic status: %s", status)
+        if not sleep_ctrl.should_capture:
+            return
+        audio_int16 = (indata[:, 0] * 32767).astype(np.int16)
+        frame = rtc.AudioFrame(
+            data=audio_int16.tobytes(),
+            sample_rate=MIC_SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+            samples_per_channel=len(audio_int16),
+        )
+        asyncio.run_coroutine_threadsafe(source.capture_frame(frame), loop)
+
+    log.info("Starting mic capture (rate=%d, device=%s)", MIC_SAMPLE_RATE, input_device)
+
+    stream = sd.InputStream(
+        device=input_device,
+        samplerate=MIC_SAMPLE_RATE,
+        channels=NUM_CHANNELS,
+        dtype="float32",
+        blocksize=MIC_SAMPLES_PER_FRAME,
+        callback=audio_callback,
+    )
+
+    with stream:
+        await stop_event.wait()
+
+    log.info("Mic capture stopped")
+
+
+# ---------------------------------------------------------------------------
+# Audio playback with state tracking
+# ---------------------------------------------------------------------------
+
+async def play_audio_track(
+    track: rtc.RemoteAudioTrack,
+    stop_event: asyncio.Event,
+    state_tracker: AgentStateTracker,
+    output_device: int | None,
+):
+    log.info("Playing audio track: %s", track.sid)
+
+    stream = sd.OutputStream(
+        device=output_device,
+        samplerate=PLAYBACK_SAMPLE_RATE,
+        channels=NUM_CHANNELS,
+        dtype="int16",
+    )
+    stream.start()
+
+    audio_stream = rtc.AudioStream(
+        track, sample_rate=PLAYBACK_SAMPLE_RATE, num_channels=NUM_CHANNELS
+    )
     try:
-        brain.init(mode)
-        _modules.append(brain)
-    except Exception as e:
-        log.error("Brain init failed: %s", e)
-
-    # Audio
-    try:
-        hw = audio.init()
-        _modules.append(audio)
-        if hw:
-            log.info("Audio: ReSpeaker v2.0 active (VAD + interruption detection)")
-        else:
-            log.warning("Audio: initialized without ReSpeaker (degraded mode)")
-    except Exception as e:
-        _modules.append(audio)
-        log.error("Audio init error: %s", e)
-
-    # Servos
-    try:
-        hw = servos.init()
-        _modules.append(servos)
-        if hw:
-            log.info("Servos: PCA9685 active (eyes + eyelids + tentacles)")
-        else:
-            log.warning("Servos: initialized without hardware (stub mode)")
-    except Exception as e:
-        _modules.append(servos)
-        log.error("Servos init error: %s", e)
-
-    # LEDs
-    try:
-        hw = leds.init()
-        _modules.append(leds)
-        if hw:
-            log.info("LEDs: NeoPixel active (steampunk animation running)")
-        else:
-            log.warning("LEDs: initialized without hardware (stub mode)")
-    except Exception as e:
-        _modules.append(leds)
-        log.error("LEDs init error: %s", e)
-
-    # Vision
-    try:
-        hw = vision.init()
-        _modules.append(vision)
-        if hw:
-            log.info("Vision: IMX500 face detection active")
-        else:
-            log.warning("Vision: initialized without hardware (stub mode)")
-    except Exception as e:
-        _modules.append(vision)
-        log.error("Vision init error: %s", e)
-
-    # Display
-    try:
-        hw = display.init()
-        _modules.append(display)
-        if hw:
-            log.info("Display: Waveshare 1.9\" LCD active (%dx%d)",
-                     display.WIDTH, display.HEIGHT)
-        else:
-            log.warning("Display: initialized without hardware (stub mode)")
-    except Exception as e:
-        _modules.append(display)
-        log.error("Display init error: %s", e)
-
-
-def _init_buttons(callbacks: dict) -> None:
-    """Initialize buttons with the given callbacks."""
-    try:
-        hw = buttons.init(callbacks)
-        _modules.append(buttons)
-        if hw:
-            log.info("Buttons: 4 GPIO buttons active")
-        else:
-            log.warning("Buttons: initialized without hardware (stub mode)")
-    except Exception as e:
-        _modules.append(buttons)
-        log.error("Buttons init error: %s", e)
-
-
-def _speak_safe(text: str) -> audio.SpeakResult:
-    """Speak text, returning SpeakResult. Catches errors gracefully."""
-    try:
-        return audio.speak(text)
-    except Exception as e:
-        log.warning("Could not speak: %s", e)
-        return audio.SpeakResult(interrupted=False, spoken_text="")
-
-
-def _track_faces():
-    """Check for detected faces and move eyes toward the best one."""
-    try:
-        faces = vision.get_faces()
-        if faces:
-            face = faces[0]  # Largest/closest face
-            servos.look_at(face.x, face.y)
+        async for event in audio_stream:
+            if stop_event.is_set():
+                break
+            frame = event.frame
+            audio_data = np.frombuffer(frame.data, dtype=np.int16)
+            state_tracker.process_frame(audio_data)
+            stream.write(audio_data.reshape(-1, NUM_CHANNELS))
     except Exception:
-        pass
+        log.exception("Audio playback error")
+    finally:
+        stream.stop()
+        stream.close()
+        log.info("Audio playback stopped")
 
 
 # ---------------------------------------------------------------------------
-# Face tracking background thread
+# Inactivity monitor
+# ---------------------------------------------------------------------------
+
+async def inactivity_monitor(
+    state_tracker: AgentStateTracker,
+    sleep_ctrl: SleepController,
+    stop_event: asyncio.Event,
+):
+    while not stop_event.is_set():
+        await asyncio.sleep(5)
+        if sleep_ctrl.is_sleeping:
+            continue
+        if state_tracker.inactive_seconds > INACTIVITY_TIMEOUT:
+            log.info("Inactivity timeout (%ds) — auto-sleep", INACTIVITY_TIMEOUT)
+            sleep_ctrl.enter_sleep()
+
+
+# ---------------------------------------------------------------------------
+# Face tracker (thread)
 # ---------------------------------------------------------------------------
 
 class _FaceTracker(threading.Thread):
-    """Continuously tracks faces in the background (~10 Hz)."""
-
     def __init__(self):
         super().__init__(daemon=True)
         self.stop_event = threading.Event()
@@ -319,224 +308,131 @@ class _FaceTracker(threading.Thread):
 
     def run(self):
         while not self.stop_event.is_set():
-            _track_faces()
+            try:
+                faces = vision.get_faces()
+                if faces:
+                    servos.look_at(faces[0].x, faces[0].y)
+            except Exception:
+                pass
             self.stop_event.wait(0.1)
 
 
 # ---------------------------------------------------------------------------
-# Main conversational loop (botijo / botija modes)
+# Main client loop with reconnection
 # ---------------------------------------------------------------------------
 
-def _run_conversational(btn_sleep_event=None):
-    """Full conversational loop with inactivity timeout and sleep mode."""
-    behavior = HARDWARE["behavior"]
-    inactivity_timeout = behavior.get("inactivity_timeout", 300)
-    warning_time = behavior.get("warning_time", 240)
+async def run_client(
+    url: str,
+    api_key: str,
+    api_secret: str,
+    room_name: str,
+    participant_name: str,
+    sleep_ctrl: SleepController,
+    input_device: int | None,
+    output_device: int | None,
+):
+    state_tracker = AgentStateTracker()
+    reconnect_delay = INITIAL_RECONNECT_DELAY
 
-    last_activity = time.time()
-    has_warned = False
-    sleeping = False
+    while True:
+        stop_event = asyncio.Event()
+        tasks: list[asyncio.Task] = []
 
-    # Start background face tracking
-    face_tracker = _FaceTracker()
-    face_tracker.start()
+        try:
+            token = generate_token(api_key, api_secret, room_name, participant_name)
+            room = rtc.Room()
 
-    log.info("Conversational loop running — listening...")
+            @room.on("reconnecting")
+            def on_reconnecting():
+                log.info("Reconnecting...")
 
-    try:
-        while True:
-            now = time.time()
-            inactive_secs = now - last_activity
+            @room.on("reconnected")
+            def on_reconnected():
+                log.info("Reconnected")
+                nonlocal reconnect_delay
+                reconnect_delay = INITIAL_RECONNECT_DELAY
 
-            # --- Button sleep override ---
-            if btn_sleep_event is not None:
-                if btn_sleep_event.is_set() and not sleeping:
-                    log.info("Button triggered sleep mode")
-                    sleeping = True
-                    has_warned = False
-                    servos.set_quiet_mode(True)
-                    leds.set_mode("off")
-                    display.show_eyes("sleepy")
-                    continue
-                elif not btn_sleep_event.is_set() and sleeping:
-                    log.info("Button triggered wake up")
-                    sleeping = False
-                    has_warned = False
-                    last_activity = time.time()
-                    servos.set_quiet_mode(False)
-                    leds.set_mode("steampunk")
-                    display.show_waveform(0.0)
-                    continue
+            @room.on("track_subscribed")
+            def on_track_subscribed(
+                track: rtc.Track,
+                publication: rtc.RemoteTrackPublication,
+                participant: rtc.RemoteParticipant,
+            ):
+                if isinstance(track, rtc.RemoteAudioTrack):
+                    log.info("Subscribed to audio from %s", participant.identity)
+                    task = asyncio.create_task(
+                        play_audio_track(track, stop_event, state_tracker, output_device)
+                    )
+                    tasks.append(task)
 
-            # --- Sleep mode ---
-            if sleeping:
-                # In sleep mode: listen for reactivation
-                servos.set_quiet_mode(True)
-                text = audio.listen()
-                if text:
-                    log.info("Reactivating from sleep — heard: %s", text)
-                    sleeping = False
-                    has_warned = False
-                    last_activity = time.time()
+            log.info("Connecting to %s room=%s as %s", url, room_name, participant_name)
+            await room.connect(url, token)
+            log.info("Connected to room: %s", room.name)
 
-                    # Wake up hardware
-                    servos.set_quiet_mode(False)
-                    leds.set_mode("steampunk")
-                    display.show_waveform(0.0)
+            reconnect_delay = INITIAL_RECONNECT_DELAY
 
-                    _speak_safe("Ah, has vuelto. Procesando tu peticion.")
+            # Publish microphone
+            source = rtc.AudioSource(
+                sample_rate=MIC_SAMPLE_RATE, num_channels=NUM_CHANNELS
+            )
+            mic_track = rtc.LocalAudioTrack.create_audio_track("mic", source)
+            await room.local_participant.publish_track(mic_track)
+            log.info("Mic track published")
 
-                    # Process the wake-up text as a normal query
-                    leds.set_mode("speaking")
-                    chunks = brain.chat_stream(text)
-                    result = audio.speak_stream(chunks)
-                    if result.interrupted:
-                        brain.note_interruption(result.spoken_text)
-                        log.info("Response interrupted")
-                    leds.set_mode("steampunk")
-                    display.show_waveform(0.0)
-                    last_activity = time.time()
-                else:
-                    time.sleep(0.1)
-                continue
+            # Start capture + inactivity monitor
+            mic_task = asyncio.create_task(
+                capture_microphone(source, stop_event, sleep_ctrl, input_device)
+            )
+            tasks.append(mic_task)
 
-            # --- Inactivity timeout check ---
-            if inactive_secs > inactivity_timeout:
-                log.info("Inactivity timeout (%ds) — entering sleep mode",
-                         inactivity_timeout)
-                sleeping = True
-                has_warned = False
-                servos.set_quiet_mode(True)
-                leds.set_mode("off")
-                display.show_eyes("sleepy")
-                continue
+            inact_task = asyncio.create_task(
+                inactivity_monitor(state_tracker, sleep_ctrl, stop_event)
+            )
+            tasks.append(inact_task)
 
-            if inactive_secs > warning_time and not has_warned:
-                log.info("Inactivity warning at %ds", int(inactive_secs))
-                _speak_safe("Sigues ahi, saco de carne? Tu silencio es sospechoso.")
-                has_warned = True
-                # Don't reset last_activity — warning doesn't count as interaction
+            # Wait for disconnect
+            disconnect_event = asyncio.Event()
 
-            # --- Normal listening ---
-            servos.set_quiet_mode(True)
-            leds.set_mode("listening")
+            @room.on("disconnected")
+            def on_disconnect(reason):
+                log.warning("Disconnected: %s", reason)
+                disconnect_event.set()
 
-            text = audio.listen()
+            await disconnect_event.wait()
 
-            servos.set_quiet_mode(False)
+        except asyncio.CancelledError:
+            log.info("Client shutting down")
+            break
+        except Exception:
+            log.exception("Connection error")
+        finally:
+            stop_event.set()
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            if text:
-                log.info("Heard: %s", text)
-                last_activity = time.time()
-                has_warned = False
+        log.info("Reconnecting in %.0fs...", reconnect_delay)
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * RECONNECT_BACKOFF, MAX_RECONNECT_DELAY)
 
-                # Respond
-                leds.set_mode("speaking")
 
-                chunks = brain.chat_stream(text)
-                result = audio.speak_stream(chunks)
+# ---------------------------------------------------------------------------
+# Hardware init (no audio/brain)
+# ---------------------------------------------------------------------------
 
-                if result.interrupted:
-                    brain.note_interruption(result.spoken_text)
-                    log.info("Response interrupted — user can say 'continua'/'sigue'")
-
-                leds.set_mode("steampunk")
+def _init_hardware():
+    for name, mod in [("servos", servos), ("leds", leds), ("vision", vision), ("display", display)]:
+        try:
+            hw = mod.init()
+            _modules.append(mod)
+            if hw:
+                log.info("%s: active", name.capitalize())
             else:
-                # No speech detected — idle
-                leds.set_mode("steampunk")
-                time.sleep(0.1)
-
-    finally:
-        face_tracker.stop()
-        face_tracker.join(timeout=2)
-
-
-# ---------------------------------------------------------------------------
-# Barbacoa mode loop
-# ---------------------------------------------------------------------------
-
-def _run_barbacoa():
-    """Barbacoa mode: autonomous phrases + face reactions + conversation."""
-    persona = personality.get_current()
-
-    # Load phrase pools
-    phrases_dict = personality.get_phrases()
-    if not phrases_dict:
-        log.error("No phrases found for barbacoa mode — falling back to conversational")
-        _run_conversational()
-        return
-
-    phrase_mgr = PhraseManager(phrases_dict)
-
-    # Speaking state checker for banter threads
-    def is_speaking():
-        return audio._is_speaking
-
-    # Auto banter config from personality
-    auto_cfg = persona.get("auto_banter", {})
-    auto_banter = AutoBanterThread(
-        speaker=lambda text: _speak_safe(text),
-        phrase_source=phrase_mgr,
-        min_s=auto_cfg.get("min_seconds", 120),
-        max_s=auto_cfg.get("max_seconds", 240),
-        consult_is_speaking=is_speaking,
-        preferred_cats=auto_cfg.get("preferred_categories", [
-            "fuego_barbacoa", "carne_comida", "aristocracia_culta",
-        ]),
-    )
-
-    # Face banter config from personality
-    face_cfg = persona.get("face_banter", {})
-    face_banter = FaceBanter(
-        speaker=lambda text: _speak_safe(text),
-        phrase_source=phrase_mgr,
-        cooldown_s=face_cfg.get("cooldown_seconds", 35),
-        category_sequence=face_cfg.get("category_sequence", [
-            "ninos_humor_blanco", "fuego_barbacoa",
-            "aristocracia_culta", "interaccion_directa",
-        ]),
-        consult_is_speaking=is_speaking,
-    )
-
-    auto_banter.start()
-    log.info("Barbacoa mode — auto-banter every %d-%ds, face cooldown %ds",
-             auto_banter.min_s, auto_banter.max_s, face_banter.cooldown_s)
-
-    try:
-        while True:
-            # Face detection — may trigger a phrase
-            faces = vision.get_faces()
-            if faces:
-                face = faces[0]
-                servos.look_at(face.x, face.y)
-                face_banter.maybe_emit()
-
-            # Listen for conversation between autonomous phrases
-            servos.set_quiet_mode(True)
-            leds.set_mode("listening")
-
-            text = audio.listen()
-
-            servos.set_quiet_mode(False)
-
-            if text:
-                log.info("[BARBACOA] Heard: %s", text)
-                leds.set_mode("speaking")
-
-                chunks = brain.chat_stream(text)
-                result = audio.speak_stream(chunks)
-
-                if result.interrupted:
-                    brain.note_interruption(result.spoken_text)
-
-                leds.set_mode("steampunk")
-            else:
-                leds.set_mode("steampunk")
-                time.sleep(0.1)
-
-    finally:
-        auto_banter.stop()
-        auto_banter.join(timeout=3)
+                log.warning("%s: stub mode", name.capitalize())
+        except Exception as e:
+            _modules.append(mod)
+            log.error("%s init error: %s", name.capitalize(), e)
 
 
 # ---------------------------------------------------------------------------
@@ -544,80 +440,87 @@ def _run_barbacoa():
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Botijo — Androide Conversacional")
-    parser.add_argument("--mode", default="botijo",
-                        choices=["botijo", "botija", "barbacoa"],
-                        help="Personality mode")
-    parser.add_argument("--debug", action="store_true",
-                        help="Enable debug logging")
+    parser = argparse.ArgumentParser(description="Botijo — LiveKit Client")
+    parser.add_argument("--room", default=os.getenv("ROOM_NAME", "botijo"))
+    parser.add_argument("--url", default=os.getenv("LIVEKIT_URL", "wss://lk.nestorcyborg.com"))
+    parser.add_argument("--name", default=os.getenv("PARTICIPANT_NAME", f"botijo-{socket.gethostname()}"))
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
+    api_key = os.environ.get("LIVEKIT_API_KEY", "")
+    api_secret = os.environ.get("LIVEKIT_API_SECRET", "")
+    if not api_key or not api_secret:
+        log.error("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set")
+        sys.exit(1)
 
-    log.info("Botijo starting — mode: %s", args.mode)
-    log.info("Hardware config loaded: %d servo channels, %d LEDs, %d buttons",
-             16, HARDWARE["leds"]["count"],
-             len([k for k in HARDWARE["buttons"] if k.startswith("btn")]))
+    log.info("Botijo LiveKit starting — room: %s", args.room)
 
-    # --- Button callbacks ---
-    _btn_sleep = threading.Event()  # set = button requests sleep
+    # Init hardware (no audio/brain)
+    _init_hardware()
 
+    # Find ReSpeaker devices
+    input_device, output_device = _find_respeaker_device()
+
+    # Sleep controller
+    sleep_ctrl = SleepController()
+
+    # Button: btn1 = toggle sleep
     def _btn1_toggle_sleep():
-        """Toggle between listening and sleep mode."""
-        if _btn_sleep.is_set():
-            log.info("Button 1: waking up")
-            _btn_sleep.clear()
-            servos.set_quiet_mode(False)
-            leds.set_mode("steampunk")
-            display.show_waveform(0.0)
+        if sleep_ctrl.is_sleeping:
+            sleep_ctrl.wake_up()
         else:
-            log.info("Button 1: entering sleep mode")
-            _btn_sleep.set()
-            servos.set_quiet_mode(True)
-            leds.set_mode("off")
-            display.show_eyes("sleepy")
+            sleep_ctrl.enter_sleep()
 
-    def _btn2_reset_history():
-        """Reset conversation history."""
-        log.info("Button 2: resetting conversation history")
-        brain.reset_history()
-        _speak_safe("Memoria borrada. Empezamos de cero.")
-
-    button_callbacks = {
-        "btn1": _btn1_toggle_sleep,
-        "btn2": _btn2_reset_history,
-    }
-
-    # --- Initialize all modules ---
-    _init_modules(args.mode)
-    _init_buttons(button_callbacks)
-
-    # --- Wire audio → display waveform callback ---
-    audio.set_audio_level_callback(display.show_waveform)
-
-    # --- Speak greeting ---
-    greeting = personality.get_greeting()
-    log.info("Greeting: %s", greeting)
-    _speak_safe(greeting)
-
-    # --- Start waveform (idle sine wave on LCD) ---
-    display.show_waveform(0.0)
-    leds.set_mode("steampunk")
-
-    # --- Run appropriate loop ---
-    log.info("Botijo ready — entering %s loop", args.mode)
     try:
-        if args.mode == "barbacoa":
-            _run_barbacoa()
+        hw = buttons.init({"btn1": _btn1_toggle_sleep})
+        _modules.append(buttons)
+        if hw:
+            log.info("Buttons: active")
         else:
-            _run_conversational(btn_sleep_event=_btn_sleep)
-    except KeyboardInterrupt:
+            log.warning("Buttons: stub mode")
+    except Exception as e:
+        _modules.append(buttons)
+        log.error("Buttons init error: %s", e)
+
+    # Face tracker
+    face_tracker = _FaceTracker()
+    face_tracker.start()
+
+    # Initial state
+    leds.set_mode("steampunk")
+    display.show_waveform(0.0)
+
+    # Run asyncio client
+    loop = asyncio.new_event_loop()
+    task = None
+
+    def signal_handler():
+        if task and not task.done():
+            task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, signal_handler)
+
+    task = loop.create_task(
+        run_client(
+            args.url, api_key, api_secret, args.room, args.name,
+            sleep_ctrl, input_device, output_device,
+        )
+    )
+
+    log.info("Botijo LiveKit ready")
+
+    try:
+        loop.run_until_complete(task)
+    except asyncio.CancelledError:
         pass
     finally:
+        face_tracker.stop()
+        face_tracker.join(timeout=2)
+        loop.close()
         _cleanup()
 
 

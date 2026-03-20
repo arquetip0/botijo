@@ -9,6 +9,7 @@ Plataforma R&D para producción futura de robots conversacionales.
 - **Run on RPi:** `cd ~/botijo && source venv_chatgpt/bin/activate && PYTHONPATH=src:vendor python src/main.py`
 - **SSH:** `ssh botijo` (user jack, /home/jack/botijo/)
 - **Modes:** `--mode botijo` (default), `--mode botija`, `--mode barbacoa`
+- **LiveKit mode:** `PYTHONPATH=src:vendor python src/main_livekit.py --debug` (requires LIVEKIT_API_KEY, LIVEKIT_API_SECRET in .env)
 
 ## Module Map (src/)
 
@@ -24,7 +25,7 @@ Plataforma R&D para producción futura de robots conversacionales.
 | `buttons.py` | GPIO buttons with callbacks |
 | `personality.py` | System prompts, tool definitions, phrase pools, `get_current()` accessor |
 | `main.py` | Orchestrator: parse args, init modules, main loop, thread-safe PhraseManager, button↔loop sleep sync |
-| `main_livekit.py` | LiveKit variant of main.py — identical for now, will diverge to use remote STT/TTS via LiveKit |
+| `main_livekit.py` | LiveKit client: connects to lk.nestorcyborg.com, streams ReSpeaker audio, receives agent TTS, drives hardware (servos/LEDs/display) from received audio state |
 
 ## Launchers (repo root)
 

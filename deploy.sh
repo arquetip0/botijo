@@ -21,6 +21,8 @@ rsync -avz panel_backend/app.py "$REMOTE:~/panel_backend/app.py"
 ssh "$REMOTE" "sudo systemctl restart panel-backend"
 echo "✅ Sync complete"
 
+# Note: first deploy with LiveKit needs: pip install livekit livekit-api sounddevice
+
 if [ "$1" = "--run" ]; then
     shift
     echo "🤖 Launching Botijo..."
