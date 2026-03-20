@@ -256,6 +256,11 @@ async def capture_microphone(
                 await source.capture_frame(frame)
             except queue_mod.Empty:
                 continue
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("capture_frame error")
+                await asyncio.sleep(0.1)
 
     log.info("Mic capture stopped (captured %d frames)", frame_count[0])
 
@@ -387,6 +392,14 @@ async def run_client(
                 nonlocal reconnect_delay
                 reconnect_delay = INITIAL_RECONNECT_DELAY
 
+            # --- Task exception logging ---
+            def _task_done_cb(task: asyncio.Task):
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc:
+                    log.error("Task %s crashed: %s", task.get_name(), exc, exc_info=exc)
+
             @room.on("track_subscribed")
             def on_track_subscribed(
                 track: rtc.Track,
@@ -398,10 +411,39 @@ async def run_client(
                     task = asyncio.create_task(
                         play_audio_track(track, stop_event, state_tracker)
                     )
+                    task.add_done_callback(_task_done_cb)
                     tasks.append(task)
 
+            # --- Disconnect handler (BEFORE connect to avoid race) ---
+            disconnect_event = asyncio.Event()
+
+            @room.on("disconnected")
+            def on_disconnect(reason):
+                log.warning("Disconnected: %s", reason)
+                disconnect_event.set()
+
+            # --- Text stream handlers (suppress "no callback attached") ---
+            async def _consume_text(reader, identity):
+                try:
+                    text = await reader.read_all()
+                    log.debug("Text stream [%s] from %s: %s",
+                              getattr(reader, 'info', None) and reader.info.topic or '?',
+                              identity, text[:200])
+                except Exception:
+                    log.debug("Text stream error", exc_info=True)
+
+            def _on_text_stream(reader, participant_identity):
+                # MUST be sync — SDK calls this synchronously
+                asyncio.create_task(_consume_text(reader, participant_identity))
+
+            for topic in ("lk.chat", "lk.transcription"):
+                try:
+                    room.register_text_stream_handler(topic, _on_text_stream)
+                except (AttributeError, ValueError):
+                    pass  # SDK version without support or topic already registered
+
             log.info("Connecting to %s room=%s as %s", url, room_name, participant_name)
-            await room.connect(url, token)
+            await asyncio.wait_for(room.connect(url, token), timeout=15.0)
             log.info("Connected to room: %s", room.name)
 
             reconnect_delay = INITIAL_RECONNECT_DELAY
@@ -419,21 +461,16 @@ async def run_client(
             mic_task = asyncio.create_task(
                 capture_microphone(source, stop_event, sleep_ctrl, input_device)
             )
+            mic_task.add_done_callback(_task_done_cb)
             tasks.append(mic_task)
 
             inact_task = asyncio.create_task(
                 inactivity_monitor(state_tracker, sleep_ctrl, stop_event)
             )
+            inact_task.add_done_callback(_task_done_cb)
             tasks.append(inact_task)
 
-            # Wait for disconnect
-            disconnect_event = asyncio.Event()
-
-            @room.on("disconnected")
-            def on_disconnect(reason):
-                log.warning("Disconnected: %s", reason)
-                disconnect_event.set()
-
+            # Wait for disconnect (handler registered above, before connect)
             await disconnect_event.wait()
 
         except asyncio.CancelledError:
@@ -495,6 +532,12 @@ def main():
     if not api_key or not api_secret:
         log.error("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set")
         sys.exit(1)
+
+    try:
+        import livekit as _lk
+        log.info("livekit SDK: %s", getattr(_lk, '__version__', '?'))
+    except Exception:
+        pass
 
     log.info("Botijo LiveKit starting — room: %s", args.room)
 

@@ -16,8 +16,8 @@ numpy>=2.0
 Pillow>=10.0
 
 # LiveKit client (for main_livekit.py)
-livekit>=0.18
-livekit-api>=0.8
+livekit~=1.1
+livekit-api~=0.8
 sounddevice>=0.5
 
 # Hardware (RPi only — uncomment on Pi, skip on macOS)
