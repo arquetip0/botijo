@@ -60,6 +60,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("botijo-lk")
 
+# Silence noisy loggers even in --debug mode
+logging.getLogger("picamera2").setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # Audio config
 # ---------------------------------------------------------------------------
@@ -436,7 +439,7 @@ async def run_client(
                 # MUST be sync — SDK calls this synchronously
                 asyncio.create_task(_consume_text(reader, participant_identity))
 
-            for topic in ("lk.chat", "lk.transcription"):
+            for topic in ("lk.chat", "lk.transcription", "lk.agent.events"):
                 try:
                     room.register_text_stream_handler(topic, _on_text_stream)
                 except (AttributeError, ValueError):
