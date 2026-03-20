@@ -67,7 +67,7 @@ logging.getLogger("picamera2").setLevel(logging.WARNING)
 # Audio config
 # ---------------------------------------------------------------------------
 MIC_SAMPLE_RATE = 16000  # ReSpeaker native rate
-PLAYBACK_SAMPLE_RATE = 24000  # Match Cartesia TTS; PyAudio/PulseAudio resamples for ReSpeaker
+PLAYBACK_SAMPLE_RATE = 48000  # ReSpeaker UAC1.0 only supports 48kHz output natively
 NUM_CHANNELS = 1
 MIC_FRAME_DURATION_MS = 20
 MIC_SAMPLES_PER_FRAME = MIC_SAMPLE_RATE * MIC_FRAME_DURATION_MS // 1000
@@ -214,6 +214,7 @@ async def capture_microphone(
     source: rtc.AudioSource,
     stop_event: asyncio.Event,
     sleep_ctrl: SleepController,
+    state_tracker: AgentStateTracker,
     input_device: int | None,
 ):
     """Capture mic via callback → queue → async consumer for steady frame rate."""
@@ -221,9 +222,18 @@ async def capture_microphone(
 
     frame_q: queue_mod.Queue = queue_mod.Queue(maxsize=50)
     frame_count = [0]
+    _silence_frame = np.zeros(MIC_SAMPLES_PER_FRAME, dtype=np.int16).tobytes()
 
     def audio_callback(indata, frames, time_info, status):
         if not sleep_ctrl.should_capture:
+            return
+        # Echo suppression: send silence while agent speaks so its own
+        # TTS output (picked up by ReSpeaker) doesn't trigger VAD interruption
+        if state_tracker.is_speaking:
+            try:
+                frame_q.put_nowait(_silence_frame)
+            except queue_mod.Full:
+                pass
             return
         audio_int16 = (indata[:, 0] * 32767).astype(np.int16)
         frame_count[0] += 1
@@ -289,7 +299,7 @@ async def play_audio_track(
         channels=NUM_CHANNELS,
         rate=PLAYBACK_SAMPLE_RATE,
         output=True,
-        frames_per_buffer=1024,
+        frames_per_buffer=4096,  # Larger buffer for RPi stability (avoid underruns)
     )
     log.info("PyAudio output stream opened (rate=%d)", PLAYBACK_SAMPLE_RATE)
 
@@ -462,7 +472,7 @@ async def run_client(
 
             # Start capture + inactivity monitor
             mic_task = asyncio.create_task(
-                capture_microphone(source, stop_event, sleep_ctrl, input_device)
+                capture_microphone(source, stop_event, sleep_ctrl, state_tracker, input_device)
             )
             mic_task.add_done_callback(_task_done_cb)
             tasks.append(mic_task)
